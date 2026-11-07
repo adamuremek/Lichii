@@ -2104,8 +2104,15 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
                 GraphicsEnvironments environments;
                 GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
                 new_pipeline = CreateGraphicsPipelineFromReusedShaders(environments);
-                if (!new_pipeline && !QueueGraphicsTranslation(std::move(environments.envs))) {
-                    return nullptr;
+                if (!new_pipeline) {
+                    const std::optional<u64> snapshot_bytes{
+                        DetachGraphicsEnvironments(environments.envs)};
+                    if (!snapshot_bytes) {
+                        new_pipeline = CreateGraphicsPipeline();
+                    } else if (!QueueGraphicsTranslation(std::move(environments.envs),
+                                                         *snapshot_bytes)) {
+                        return nullptr;
+                    }
                 }
             } else {
                 translated_again += keep ? 1 : 0;
@@ -2884,6 +2891,7 @@ struct {
     size_t copied_bytes{}; ///< Constant buffer contents copied to detach their environments.
     u32 adopted{};
     u32 timed_out{}; ///< Draws skipped because the translation outlasted the wait budget.
+    u32 on_gpu_thread{}; ///< Translations that needed more than the detached environments hold.
 } async_translations;
 
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
@@ -2930,11 +2938,11 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
                  "({:.1f} ms of it graphics SPIR-V), {:.1f} ms graphics SPIR-V on workers, "
                  "{:.1f} ms of draws held for unbuilt pipelines{}; graphics translations on "
                  "workers: {} queued ({} KiB of state copied), {} adopted, {} past the wait "
-                 "budget",
+                 "budget, {} left to the GPU thread",
                  count, ms(total), ms(take(runtime_spirv_ns[0])), ms(take(runtime_spirv_ns[1])),
                  ms(GraphicsPipeline::TakeHoldTime()), v2, async_translations.queued,
                  async_translations.copied_bytes / 1024, async_translations.adopted,
-                 async_translations.timed_out);
+                 async_translations.timed_out, async_translations.on_gpu_thread);
         async_translations = {};
         total = {};
         total_translation_wait = {};
@@ -3099,7 +3107,7 @@ void PipelineCache::SerializeGraphicsPipeline(const GraphicsPipelineCacheKey& ke
 // build then runs as BuiltPipeline waits for it. Compute pipelines stay synchronous: a skipped
 // dispatch loses its outputs.
 bool PipelineCache::CanTranslateAsynchronously() const {
-    if (!use_asynchronous_shaders) {
+    if (!use_asynchronous_shaders || synchronous_graphics.contains(graphics_key)) {
         return false;
     }
     const PendingDrawPolicy policy{CurrentPendingDrawPolicy()};
@@ -3130,21 +3138,35 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipelineFromReuse
     return pipeline;
 }
 
-bool PipelineCache::QueueGraphicsTranslation(GraphicsEnvironmentArray envs) {
+std::optional<u64> PipelineCache::DetachGraphicsEnvironments(GraphicsEnvironmentArray& envs) {
+    std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>> texture_pool;
     u64 snapshot_bytes{};
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
-        if (graphics_key.unique_hashes[index] != 0) {
-            envs[index].Detach();
-            snapshot_bytes += envs[index].SnapshotSizeBytes();
+        if (graphics_key.unique_hashes[index] == 0) {
+            continue;
         }
+        if (!envs[index].Detach(texture_pool)) {
+            return std::nullopt;
+        }
+        snapshot_bytes += envs[index].SnapshotSizeBytes();
+    }
+    if (texture_pool) {
+        snapshot_bytes += texture_pool->size() * sizeof(Tegra::Texture::TICEntry);
     }
     async_translations.copied_bytes += snapshot_bytes;
+    return snapshot_bytes;
+}
+
+bool PipelineCache::QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 snapshot_bytes) {
     const VideoCommon::ShaderJobHandle job{shader_jobs->Submit({
         .priority = VideoCommon::ShaderJobPriority::Soon,
         .cpu_bytes = TranslationBytes(snapshot_bytes),
         .cpu = [this, key = graphics_key, envs = std::move(envs)](
-                   VideoCommon::ShaderJobContext&) mutable -> VideoCommon::ShaderDriverStage {
-            TranslateGraphicsPipeline(key, std::move(envs));
+                   VideoCommon::ShaderJobContext& context) mutable
+        -> VideoCommon::ShaderDriverStage {
+            if (!context.StopRequested()) {
+                TranslateGraphicsPipeline(key, std::move(envs));
+            }
             return {};
         },
     })};
@@ -3182,9 +3204,12 @@ void PipelineCache::TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& ke
     std::shared_ptr<ShaderPools> emit_pools{TakeSparePools()};
     ShaderPools& pools{*emit_pools};
     std::unique_ptr<GraphicsPipeline> pipeline;
+    bool translate_on_gpu_thread{};
     try {
         pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, true,
                                           std::move(emit_pools));
+    } catch (const VideoCommon::DetachedEnvironmentMiss&) {
+        translate_on_gpu_thread = true;
     } catch (const std::exception& exception) {
         // Shader errors are handled inside; nothing else may fail the job unadopted.
         LOG_ERROR(Render_Vulkan, "Graphics pipeline translation failed: {}", exception.what());
@@ -3194,6 +3219,7 @@ void PipelineCache::TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& ke
         .key = key,
         .pipeline = std::move(pipeline),
         .envs = std::move(envs),
+        .translate_on_gpu_thread = translate_on_gpu_thread,
     });
     num_translated.store(translated_graphics.size(), std::memory_order_release);
 }
@@ -3207,6 +3233,12 @@ void PipelineCache::AdoptTranslatedGraphicsPipelines() {
     }
     for (TranslatedGraphicsPipeline& result : translated) {
         translating_graphics.erase(result.key);
+        if (result.translate_on_gpu_thread) {
+            // The next lookup translates it on the GPU thread.
+            synchronous_graphics.insert(result.key);
+            ++async_translations.on_gpu_thread;
+            continue;
+        }
         ++async_translations.adopted;
         if (result.pipeline) {
             SerializeGraphicsPipeline(result.key, std::move(result.envs));

@@ -20,6 +20,7 @@
 #include <sstream>
 #include <utility>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/cityhash.h"
 #include "common/common_types.h"
@@ -260,8 +261,7 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     }
     const u64 address = u64{ReadCbufValue(index, offset)} |
                         (u64{ReadCbufValue(index, offset + 4)} << 32);
-    const bool mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
-                        gpu_memory->IsFullyMappedRange(address, 1);
+    const bool mapped = IsMappedGpuAddress(address);
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
     return mapped;
 }
@@ -276,13 +276,16 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
         const u64 holder =
             u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
         if (gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
-            const u64 address = gpu_memory->Read<u64>(holder + indirect);
-            mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
-                     gpu_memory->IsFullyMappedRange(address, 1);
+            mapped = IsMappedGpuAddress(gpu_memory->Read<u64>(holder + indirect));
         }
     }
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
     return mapped;
+}
+
+bool GenericEnvironment::IsMappedGpuAddress(u64 address) const {
+    return address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+           gpu_memory->IsFullyMappedRange(address, 1);
 }
 
 std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() const {
@@ -463,33 +466,38 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
     return std::nullopt;
 }
 
+// Past the pool, the bytes are not a descriptor: reading them gave the shader a random texture
+// type and format (garbage-format asserts, then crashes and device losses on AMD in Ocarina of
+// Time). At draw time the texture cache binds the null view for such an index (VisitImageView), so
+// compile for what that view is: a plain 2D RGBA8 texture.
+static Tegra::Texture::TICEntry PastPoolTextureDescriptor(u32 raw, u32 index, u32 tic_limit) {
+    static std::atomic<u32> warnings{};
+    if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_WARNING(HW_GPU, "Texture handle {:#x} indexes past the descriptor pool "
+                            "(index {} > limit {}); using a null 2D texture",
+                    raw, index, tic_limit);
+    }
+    Tegra::Texture::TICEntry entry;
+    entry.raw.fill(0);
+    entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
+    entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
+    entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
+    entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
+    entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
+    entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
+    entry.normalized_coords.Assign(1);
+    return entry;
+}
+
 Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
                                                              bool via_header_index, u32 raw) {
     const auto handle{Tegra::Texture::TexturePair(raw, via_header_index)};
     const u32 index{Tegra::Texture::TextureHeaderIndex(handle.first, tic_limit,
                                                        gpu_memory->UsesNativeTiling())};
-    Tegra::Texture::TICEntry entry;
     if (index > tic_limit) {
-        // Past the pool, the bytes are not a descriptor: reading them gave the shader a random
-        // texture type and format (garbage-format asserts, then crashes and device losses on AMD
-        // in Ocarina of Time). At draw time the texture cache binds the null view for such an
-        // index (VisitImageView), so compile for what that view is: a plain 2D RGBA8 texture.
-        static std::atomic<u32> warnings{};
-        if (warnings.fetch_add(1, std::memory_order_relaxed) < 16) {
-            LOG_WARNING(HW_GPU, "Texture handle {:#x} indexes past the descriptor pool "
-                                "(index {} > limit {}); using a null 2D texture",
-                        raw, index, tic_limit);
-        }
-        entry.raw.fill(0);
-        entry.format.Assign(Tegra::Texture::TextureFormat::A8B8G8R8);
-        entry.r_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.g_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.b_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.a_type.Assign(Tegra::Texture::ComponentType::UNORM);
-        entry.texture_type.Assign(Tegra::Texture::TextureType::Texture2D);
-        entry.normalized_coords.Assign(1);
-        return entry;
+        return PastPoolTextureDescriptor(raw, index, tic_limit);
     }
+    Tegra::Texture::TICEntry entry;
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     if (texture_pool_flushed) {
         gpu_memory->ReadBlockUnsafe(descriptor_addr, &entry, sizeof(entry));
@@ -1054,8 +1062,13 @@ u32 GraphicsEnvironment::ReadViewportTransformState() {
 
 Tegra::Texture::TICEntry GraphicsEnvironment::ReadTextureDescriptor(u32 handle) {
     if (snapshot) {
-        return ReadTextureInfo(snapshot->texture_pool, snapshot->texture_pool_limit,
-                               snapshot->via_header_index, handle);
+        const auto pair{Tegra::Texture::TexturePair(handle, snapshot->via_header_index)};
+        const u32 index{Tegra::Texture::TextureHeaderIndex(
+            pair.first, snapshot->texture_pool_limit, snapshot->native_tiling)};
+        if (index > snapshot->texture_pool_limit) {
+            return PastPoolTextureDescriptor(handle, index, snapshot->texture_pool_limit);
+        }
+        return (*snapshot->texture_pool)[index];
     }
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
@@ -1063,14 +1076,57 @@ Tegra::Texture::TICEntry GraphicsEnvironment::ReadTextureDescriptor(u32 handle) 
                            handle);
 }
 
-// Runs on the GPU thread, before the environment is handed to a translation worker.
+bool GraphicsEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
+    if (!snapshot) {
+        return GenericEnvironment::IsCbufStorageBufferPointer(index, offset);
+    }
+    const u64 key = MakeCbufKey(index, offset);
+    if (const auto it = storage_pointer_types.find(key); it != storage_pointer_types.end()) {
+        return it->second != 0;
+    }
+    if (!Common::IsAligned(offset, sizeof(u32))) {
+        throw DetachedEnvironmentMiss{};
+    }
+    // Recorded for the disk cache, as an attached environment does.
+    (void)ReadCbufValue(index, offset);
+    (void)ReadCbufValue(index, offset + 4);
+    const bool mapped = snapshot->mapped_pointers.contains(key);
+    storage_pointer_types.emplace(key, static_cast<u8>(mapped));
+    return mapped;
+}
+
+bool GraphicsEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
+    if (!snapshot) {
+        return GenericEnvironment::IsCbufIndirectStorageBufferPointer(index, offset, indirect);
+    }
+    const auto it = storage_pointer_types.find(MakeIndirectCbufKey(index, offset, indirect));
+    if (it == storage_pointer_types.end()) {
+        throw DetachedEnvironmentMiss{};
+    }
+    return it->second != 0;
+}
+
+// Runs on the GPU thread, before the environment is handed to a translation worker. Afterwards
+// the environment reads neither the 3D engine nor guest memory nor the GPU address space.
 // - Constant buffers are copied whole, as they are at the draw.
-// - The texture pool is only located: its entries are read on the worker, unflushed, as they are
-//   at translation.
-// - Whether a storage buffer pointer is mapped, and the pointer tables behind them, are checked
-//   on the worker against the GPU address space as it is at translation.
-void GraphicsEnvironment::Detach() {
+// - The texture pool is copied whole.
+// - Every 4-byte aligned constant buffer slot is classified as a storage buffer pointer or not.
+//   Pointer tables behind a pointer are not read: asking about one throws
+//   DetachedEnvironmentMiss.
+bool GraphicsEnvironment::Detach(
+    std::shared_ptr<const std::vector<Tegra::Texture::TICEntry>>& texture_pool) {
     const auto& regs{maxwell3d->regs};
+    const size_t pool_entries{size_t{regs.tex_header.limit} + 1};
+    if (native_source_size == 0 ||
+        pool_entries * sizeof(Tegra::Texture::TICEntry) > MaxDetachedTexturePoolBytes) {
+        return false;
+    }
+    if (!texture_pool) {
+        auto pool{std::make_shared<std::vector<Tegra::Texture::TICEntry>>(pool_entries)};
+        gpu_memory->ReadBlock(regs.tex_header.Address(), pool->data(),
+                              pool->size() * sizeof(Tegra::Texture::TICEntry));
+        texture_pool = std::move(pool);
+    }
     EngineSnapshot copy;
     const auto& live_buffers{maxwell3d->state.shader_stages[stage_index].const_buffers};
     for (size_t index = 0; index < live_buffers.size(); ++index) {
@@ -1084,17 +1140,29 @@ void GraphicsEnvironment::Detach() {
         copied.size = (std::min)(live.size, static_cast<u32>(Maxwell::MaxConstBufferSize));
         copied.words.resize(Common::DivCeil(copied.size, u32{sizeof(u32)}) + 1);
         gpu_memory->ReadWordsUnsafe(live.address, copied.words.data(), copied.words.size());
+        // Offsets at or past `size` read as zero, as ReadCbufValue answers them.
+        for (u32 offset = 0; offset < copied.size; offset += sizeof(u32)) {
+            const u64 low{copied.words[offset / sizeof(u32)]};
+            const u64 high{offset + sizeof(u32) < copied.size
+                               ? copied.words[offset / sizeof(u32) + 1]
+                               : 0};
+            if (IsMappedGpuAddress(low | (high << 32))) {
+                copy.mapped_pointers.insert(MakeCbufKey(static_cast<u32>(index), offset));
+            }
+        }
     }
-    copy.texture_pool = regs.tex_header.Address();
+    copy.texture_pool = texture_pool;
     copy.texture_pool_limit = regs.tex_header.limit;
     copy.via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    copy.native_tiling = gpu_memory->UsesNativeTiling();
     copy.viewport_scale_offset_enabled = regs.viewport_scale_offset_enabled;
     if (has_hle_engine_state) {
         copy.replace_table = maxwell3d->replace_table;
     }
     snapshot = std::move(copy);
     maxwell3d = nullptr;
-    texture_pool_flushed = true;
+    gpu_memory = nullptr;
+    return true;
 }
 
 size_t GraphicsEnvironment::SnapshotSizeBytes() const noexcept {

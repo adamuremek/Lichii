@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
+#include "common/container/unordered_set.h"
 #include <vector>
 
 #include "common/common_types.h"
@@ -200,6 +201,8 @@ private:
         GraphicsPipelineCacheKey key;
         std::unique_ptr<GraphicsPipeline> pipeline; ///< Null when it is skipped or failed.
         GraphicsEnvironmentArray envs;              ///< For the disk cache.
+        /// The detached environments could not answer translation (DetachedEnvironmentMiss).
+        bool translate_on_gpu_thread{};
     };
 
     /// Queues the disk cache record of a new graphics pipeline.
@@ -213,9 +216,14 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipelineFromReusedShaders(
         GraphicsEnvironments& environments);
 
+    /// Detaches the environments of graphics_key's programs from the engine and guest memory.
+    /// The bytes copied, or nullopt when one cannot be (the pipeline is then translated on the
+    /// GPU thread).
+    [[nodiscard]] std::optional<u64> DetachGraphicsEnvironments(GraphicsEnvironmentArray& envs);
+
     /// Queues the translation of graphics_key's pipeline as a shader job and waits for it within
     /// the native wait budget. True when it was adopted into graphics_cache in time.
-    bool QueueGraphicsTranslation(GraphicsEnvironmentArray envs);
+    bool QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 snapshot_bytes);
 
     /// The CPU stage of a queued translation, on a shader job worker.
     void TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& key,
@@ -367,6 +375,8 @@ private:
     std::mutex translated_mutex;
     std::vector<TranslatedGraphicsPipeline> translated_graphics;
     std::atomic<size_t> num_translated{};
+    /// Keys whose translation needs more than detached environments hold (GPU thread only).
+    ::Common::unordered_set<GraphicsPipelineCacheKey> synchronous_graphics;
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
