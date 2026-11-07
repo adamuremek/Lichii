@@ -189,7 +189,7 @@ private:
     /// Shaders of an earlier graphics pipeline that fit `envs` (vk_shader_reuse.h), or null.
     [[nodiscard]] std::shared_ptr<const ReusableShaders> FindReusableShaders(
         const ShaderTranslationKey& key, std::span<Shader::Environment* const> envs,
-        u64 pipeline_hash) const;
+        u64 pipeline_hash);
 
     [[nodiscard]] bool StaleNullPointerSlot(const ComputePipelineCacheEntry& entry) const;
 
