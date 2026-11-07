@@ -33,6 +33,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/renderer_vulkan/async_draw_policy.h"
 #include "video_core/bounded_store.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -151,6 +152,17 @@ private:
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
+    /// How the current draw treats an unbuilt pipeline (native_async_draws, CanDiscardPendingDraw).
+    struct PendingDrawPolicy {
+        bool native;
+        NativePendingMode mode;
+        bool can_discard;
+    };
+    [[nodiscard]] PendingDrawPolicy CurrentPendingDrawPolicy() const;
+
+    /// Charges the time since `begin` to this frame's native wait budget.
+    void ChargeNativeWait(std::chrono::steady_clock::time_point begin);
+
     /// With `keep_pointers`, the slots an evicted pipeline of this key bound stay storage buffer
     /// pointers whatever they hold now.
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
@@ -179,7 +191,38 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        ParallelTranslation* parallel = nullptr);
+        ParallelTranslation* parallel = nullptr, bool allow_translation = true);
+
+    using GraphicsEnvironmentArray = decltype(GraphicsEnvironments::envs);
+
+    /// A graphics pipeline translated on a shader job worker, waiting for the GPU thread.
+    struct TranslatedGraphicsPipeline {
+        GraphicsPipelineCacheKey key;
+        std::unique_ptr<GraphicsPipeline> pipeline; ///< Null when it is skipped or failed.
+        GraphicsEnvironmentArray envs;              ///< For the disk cache.
+    };
+
+    /// Queues the disk cache record of a new graphics pipeline.
+    void SerializeGraphicsPipeline(const GraphicsPipelineCacheKey& key,
+                                   GraphicsEnvironmentArray envs);
+
+    /// Whether graphics_key's new pipeline is translated on a shader job worker.
+    [[nodiscard]] bool CanTranslateAsynchronously() const;
+
+    /// Builds graphics_key's pipeline from shaders an earlier pipeline translated, null if none fit.
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipelineFromReusedShaders(
+        GraphicsEnvironments& environments);
+
+    /// Queues the translation of graphics_key's pipeline as a shader job and waits for it within
+    /// the native wait budget. True when it was adopted into graphics_cache in time.
+    bool QueueGraphicsTranslation(GraphicsEnvironmentArray envs);
+
+    /// The CPU stage of a queued translation, on a shader job worker.
+    void TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& key,
+                                   GraphicsEnvironmentArray envs);
+
+    /// Moves the pipelines the shader job workers translated into graphics_cache (GPU thread).
+    void AdoptTranslatedGraphicsPipelines();
 
     /// Released IR pools for a build, or new ones
     [[nodiscard]] std::shared_ptr<ShaderPools> TakeSparePools();
@@ -316,6 +359,14 @@ private:
     std::mutex spare_pools_mutex;
     std::vector<std::shared_ptr<ShaderPools>> spare_pools;
     ShaderReuseCache shader_reuse;
+
+    /// Keys whose pipeline is being translated as a shader job, with its job (GPU thread only).
+    ::Common::unordered_map<GraphicsPipelineCacheKey, VideoCommon::ShaderJobHandle>
+        translating_graphics;
+    /// Finished translations, handed from the shader job workers to the GPU thread.
+    std::mutex translated_mutex;
+    std::vector<TranslatedGraphicsPipeline> translated_graphics;
+    std::atomic<size_t> num_translated{};
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
