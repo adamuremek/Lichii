@@ -2080,48 +2080,24 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     }
     auto it{graphics_cache.find(graphics_key)};
     if (it == graphics_cache.end()) {
-        if (translating_graphics.contains(graphics_key)) {
+        if (const auto in_flight{translating_graphics.find(graphics_key)};
+            in_flight != translating_graphics.end()) {
             // Its translation is still running as a shader job.
-            return nullptr;
-        }
-        ReportNewPipelineKey(graphics_key);
-        std::unique_ptr<GraphicsPipeline> new_pipeline;
-        if (scheduled_prebuild) {
-            new_pipeline = scheduled_prebuild->Take(graphics_key);
-        }
-        if (StutterTrace::Enabled()) {
-            StutterTrace::CountLookup(new_pipeline ? StutterTrace::Lookup::GraphicsBackground
-                                      : disk_pipelines.contains(graphics_key.Hash())
-                                          ? StutterTrace::Lookup::GraphicsRecorded
-                                          : StutterTrace::Lookup::GraphicsNew);
-        }
-        if (!new_pipeline) {
-            const auto keep = evicted_pointer_slots.Take(graphics_key.Hash());
-            if (auto kept = kept_stages.Take(graphics_key)) {
-                new_pipeline = RebuildGraphicsPipeline(std::move(*kept));
-                ++rebuilt_from_kept;
-            } else if (!keep && CanTranslateAsynchronously()) {
-                GraphicsEnvironments environments;
-                GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
-                new_pipeline = CreateGraphicsPipelineFromReusedShaders(environments);
-                if (!new_pipeline) {
-                    const std::optional<u64> snapshot_bytes{
-                        DetachGraphicsEnvironments(environments.envs)};
-                    if (!snapshot_bytes) {
-                        new_pipeline = CreateGraphicsPipeline();
-                    } else if (!QueueGraphicsTranslation(std::move(environments.envs),
-                                                         *snapshot_bytes)) {
-                        return nullptr;
-                    }
-                }
-            } else {
-                translated_again += keep ? 1 : 0;
-                new_pipeline = CreateGraphicsPipeline(keep ? &*keep : nullptr);
+            if (!WaitForGraphicsTranslation(in_flight->second)) {
+                return nullptr;
             }
+            it = graphics_cache.find(graphics_key);
         }
-        it = graphics_cache.find(graphics_key);
+        // Not in flight, or its translation was left to the GPU thread.
         if (it == graphics_cache.end()) {
-            it = graphics_cache.emplace(graphics_key, std::move(new_pipeline)).first;
+            std::unique_ptr<GraphicsPipeline> new_pipeline{NewGraphicsPipeline()};
+            if (!new_pipeline && translating_graphics.contains(graphics_key)) {
+                return nullptr;
+            }
+            it = graphics_cache.find(graphics_key);
+            if (it == graphics_cache.end()) {
+                it = graphics_cache.emplace(graphics_key, std::move(new_pipeline)).first;
+            }
         }
     } else if (StutterTrace::Enabled() && it->second && !it->second->WasUsed()) {
         StutterTrace::CountLookup(StutterTrace::Lookup::GraphicsPrebuilt);
@@ -2141,6 +2117,47 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
     current_pipeline = pipeline.get();
     current_pipeline->MarkUsed(frame_count);
     return BuiltPipeline(current_pipeline);
+}
+
+std::unique_ptr<GraphicsPipeline> PipelineCache::NewGraphicsPipeline() {
+    namespace StutterTrace = VideoCommon::StutterTrace;
+    ReportNewPipelineKey(graphics_key);
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    if (scheduled_prebuild) {
+        pipeline = scheduled_prebuild->Take(graphics_key);
+    }
+    if (StutterTrace::Enabled()) {
+        StutterTrace::CountLookup(pipeline ? StutterTrace::Lookup::GraphicsBackground
+                                  : disk_pipelines.contains(graphics_key.Hash())
+                                      ? StutterTrace::Lookup::GraphicsRecorded
+                                      : StutterTrace::Lookup::GraphicsNew);
+    }
+    if (pipeline) {
+        return pipeline;
+    }
+    const auto keep = evicted_pointer_slots.Take(graphics_key.Hash());
+    if (auto kept = kept_stages.Take(graphics_key)) {
+        ++rebuilt_from_kept;
+        return RebuildGraphicsPipeline(std::move(*kept));
+    }
+    if (!keep && CanTranslateAsynchronously()) {
+        GraphicsEnvironments environments;
+        GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+        pipeline = CreateGraphicsPipelineFromReusedShaders(environments);
+        if (pipeline) {
+            return pipeline;
+        }
+        if (const std::optional<u64> snapshot_bytes{
+                DetachGraphicsEnvironments(environments.envs)}) {
+            if (!QueueGraphicsTranslation(std::move(environments.envs), *snapshot_bytes) ||
+                graphics_cache.contains(graphics_key)) {
+                return nullptr;
+            }
+        }
+        return CreateGraphicsPipeline();
+    }
+    translated_again += keep ? 1 : 0;
+    return CreateGraphicsPipeline(keep ? &*keep : nullptr);
 }
 
 void PipelineCache::TickFrame() {
@@ -3172,21 +3189,36 @@ bool PipelineCache::QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 
     })};
     translating_graphics.emplace(graphics_key, job);
     ++async_translations.queued;
+    return WaitForGraphicsTranslation(job);
+}
 
+bool PipelineCache::WaitForGraphicsTranslation(VideoCommon::ShaderJobHandle job) {
     const PendingDrawPolicy policy{CurrentPendingDrawPolicy()};
-    // No wait while more translations are pending than there are CPU workers.
-    if (DecideNativePending(policy.mode, policy.can_discard, native_wait_budget_us) !=
-            NativeDrawAction::WaitTimed ||
-        translating_graphics.size() > GetTotalPipelineWorkers()) {
-        return false;
+    NativeDrawAction action{policy.can_discard ? NativeDrawAction::Skip : NativeDrawAction::Wait};
+    if (policy.native) {
+        action = DecideNativePending(policy.mode, policy.can_discard, native_wait_budget_us);
     }
-    shader_jobs->Promote(job, VideoCommon::ShaderJobPriority::NeedNow);
-    const auto begin = std::chrono::steady_clock::now();
-    const bool in_time = job.WaitFor(std::chrono::microseconds{native_wait_budget_us});
-    ChargeNativeWait(begin);
-    if (!in_time) {
-        ++async_translations.timed_out;
+    switch (action) {
+    case NativeDrawAction::Skip:
         return false;
+    case NativeDrawAction::Wait:
+        shader_jobs->RunOrWait(job);
+        break;
+    case NativeDrawAction::WaitTimed: {
+        // No wait while more translations are pending than there are CPU workers.
+        if (translating_graphics.size() > GetTotalPipelineWorkers()) {
+            return false;
+        }
+        shader_jobs->Promote(job, VideoCommon::ShaderJobPriority::NeedNow);
+        const auto begin = std::chrono::steady_clock::now();
+        const bool in_time = job.WaitFor(std::chrono::microseconds{native_wait_budget_us});
+        ChargeNativeWait(begin);
+        if (!in_time) {
+            ++async_translations.timed_out;
+            return false;
+        }
+        break;
+    }
     }
     AdoptTranslatedGraphicsPipelines();
     return true;

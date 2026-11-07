@@ -149,6 +149,11 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
+    /// The pipeline of graphics_key, not in graphics_cache: prebuilt, rebuilt, from reused
+    /// shaders or translated. Null when it is skipped, or while its translation runs as a shader
+    /// job (translating_graphics).
+    std::unique_ptr<GraphicsPipeline> NewGraphicsPipeline();
+
     /// Returns `pipeline` when it is built or its draw must wait for it, nullptr when the draw
     /// may be skipped while it builds (asynchronous shaders, CanDiscardPendingDraw).
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
@@ -221,9 +226,14 @@ private:
     /// GPU thread).
     [[nodiscard]] std::optional<u64> DetachGraphicsEnvironments(GraphicsEnvironmentArray& envs);
 
-    /// Queues the translation of graphics_key's pipeline as a shader job and waits for it within
-    /// the native wait budget. True when it was adopted into graphics_cache in time.
+    /// Queues the translation of graphics_key's pipeline as a shader job and waits for it as
+    /// WaitForGraphicsTranslation does.
     bool QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 snapshot_bytes);
+
+    /// Waits for a queued translation as the current draw's pending policy allows: until it is
+    /// done for a draw that cannot be skipped, within the native wait budget for a bounded one.
+    /// True when the translation finished and its result was adopted.
+    bool WaitForGraphicsTranslation(VideoCommon::ShaderJobHandle job);
 
     /// The CPU stage of a queued translation, on a shader job worker.
     void TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& key,
