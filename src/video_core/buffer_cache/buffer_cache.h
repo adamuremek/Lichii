@@ -3443,26 +3443,31 @@ void BufferCache<P>::UpdateIndexBuffer() {
         };
         return;
     }
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    if (size == 0 || !device_addr) {
+    const auto serial = [&]() -> std::optional<GeometryRange> {
+        return IndexBufferRange(index_buffer_ref, *gpu_memory);
+    };
+    const GeometryRange range =
+        *(prepared_geometry ? prepared_geometry->Resolve(PreparedGeometry::IndexSlot, serial)
+                            : serial());
+    if (!range.bound) {
         channel_state->index_buffer = NULL_BINDING;
         return;
     }
-    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+    const BufferId buffer_id = FindBuffer(range.device_addr, range.size, false);
     channel_state->index_buffer = Binding{
-        .device_addr = *device_addr,
-        .size = size,
+        .device_addr = range.device_addr,
+        .size = range.size,
         .buffer_id = buffer_id,
     };
     if (memo_hit) {
-        if (memo.device_addr != *device_addr || memo.buffer_id != buffer_id) {
+        if (memo.device_addr != range.device_addr || memo.buffer_id != buffer_id) {
             static std::atomic<u32> reports{};
             if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_ERROR(HW_GPU,
                           "Nx2Perf index buffer memo mismatch: {:#x}+{:#x} kept {:#x} buffer {}, "
                           "found {:#x} buffer {}",
                           gpu_addr_begin, size, memo.device_addr, memo.buffer_id.index,
-                          *device_addr, buffer_id.index);
+                          range.device_addr, buffer_id.index);
             }
         }
         return;
@@ -3475,8 +3480,8 @@ void BufferCache<P>::UpdateIndexBuffer() {
         .end = gpu_addr_end,
         .map_serial = map_serial,
         .deletions = buffer_deletions,
-        .device_addr = *device_addr,
-        .found_size = size,
+        .device_addr = range.device_addr,
+        .found_size = range.size,
         .buffer_id = buffer_id,
     };
 }
@@ -3499,30 +3504,24 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     if (!maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index]) {
         return;
     }
-    const auto& array = maxwell3d->regs.vertex_streams[index];
-    const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
-    const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
-    const u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
-    if (native && array.enable != 0 && native_size > (std::numeric_limits<u32>::max)()) {
+    const auto serial = [&] {
+        return VertexStreamRange(maxwell3d->regs, native, *gpu_memory, index);
+    };
+    const std::optional<GeometryRange> range =
+        prepared_geometry ? prepared_geometry->Resolve(index, serial) : serial();
+    if (!range) {
         throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
     }
-    const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
-    const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
-    u32 size = address_size; // TODO: Analyze stride and number of vertices
-    if (array.enable == 0 || size == 0 || !device_addr) {
+    if (!range->bound) {
         channel_state->vertex_buffers[index] = NULL_BINDING;
         UpdateVertexBufferSlot(index, NULL_BINDING);
         return;
     }
-    if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr_end) || size >= 64_MiB) {
-        size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr_begin, size));
-    }
-    const BufferId buffer_id = FindBuffer(*device_addr, size, false);
+    const BufferId buffer_id = FindBuffer(range->device_addr, range->size, false);
     const Binding binding{
-        .device_addr = *device_addr,
-        .size = size,
+        .device_addr = range->device_addr,
+        .size = range->size,
         .buffer_id = buffer_id,
     };
     channel_state->vertex_buffers[index] = binding;
