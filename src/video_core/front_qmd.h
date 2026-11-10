@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -140,6 +141,7 @@ public:
     void Lose() {
         synced = false;
         inline_writes_count = 0;
+        last_upload_write = 0;
         ClearWaiting();
     }
 
@@ -164,6 +166,48 @@ public:
         written.position = split.Position();
         written.qmd = qmd;
         written.overwritten = false;
+    }
+
+    /// The last data word of a linear inline upload was just sent: running it, the back has written
+    /// `size` known bytes at `offset` of the QMD at `qmd_address` (`device`). `prior`: the last
+    /// write sent to the QMD before the upload (Memory::WritesTarget then). Ocarina of Time writes
+    /// its QMDs this way and schedules them four words later: without the bytes here each signal
+    /// waited for the back (~800 a second), and those valued late lost the table about once a
+    /// frame. The rest of the QMD is the inline write sent at `prior`, or memory once the back ran
+    /// `prior`; where the front has neither, nothing is noted and the signal waits as before.
+    template <typename Memory>
+    void NoteUploadedQmd(const GpuSplit& split, const Memory& memory, GPUVAddr qmd_address,
+                         u64 device, u32 offset, const u8* bytes, u32 size, u64 prior) {
+        Descriptor qmd;
+        if (offset + size > sizeof(qmd) || memory.GpuWritten(device, sizeof(qmd))) {
+            return;
+        }
+        if (size != sizeof(qmd)) {
+            if (const InlineWrite* written = QueuedInlineWrite(split, device);
+                written != nullptr && written->position == prior) {
+                qmd = written->qmd;
+            } else if (split.Ran(prior)) {
+                memory.Read(qmd_address, qmd.data(), sizeof(qmd));
+            } else {
+                return;
+            }
+        }
+        std::memcpy(reinterpret_cast<u8*>(qmd.data()) + offset, bytes, size);
+        NoteInlineWrite(split, device, qmd);
+        last_upload_write = inline_writes_count;
+    }
+
+    /// A word of an inline upload is a GPU-written list word the front does not know
+    /// (Nx2ListIndirect): the upload's bytes are not the front's to note.
+    void TaintUploads(const GpuSplit& split) {
+        uploads_tainted_at = split.Position();
+        if (inline_writes_count != 0 && last_upload_write == inline_writes_count) {
+            inline_writes[(inline_writes_count - 1) % inline_writes.size()].overwritten = true;
+        }
+    }
+    /// Whether an upload word sent after `position` was such a word.
+    [[nodiscard]] bool UploadsTaintedSince(u64 position) const {
+        return uploads_tainted_at > position;
     }
 
     /// The scheduling of PCAS action `argument` on the QMD at `address` that the back runs at the
@@ -644,6 +688,10 @@ private:
     /// behind has some ten to write, a few times that in long frames.
     std::array<InlineWrite, 256> inline_writes{};
     size_t inline_writes_count{};
+    /// inline_writes_count right after the last write NoteUploadedQmd noted, and the position of
+    /// the last upload word the front did not know (TaintUploads).
+    size_t last_upload_write{};
+    u64 uploads_tainted_at{};
     /// TEST (EDEN_NX2_DRAIN_CHECK): see TakeChecks.
     std::vector<Nx2DrainCheck::QmdRelease> checks;
     std::vector<Nx2DrainCheck::QmdRead> check_reads;
