@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +30,49 @@ struct RateLimit {
         }
         next = now + std::chrono::seconds{1};
         return true;
+    }
+};
+
+// Bounded windows preserve exact frame quantiles without per-frame log writes or allocation.
+struct FrameTimeWindow {
+    static constexpr size_t Capacity = 300;
+    std::array<u64, Capacity> intervals_ns{};
+    size_t count{};
+
+    bool Add(u64 interval_ns) {
+        if (count < Capacity) {
+            intervals_ns[count++] = interval_ns;
+        }
+        return count == Capacity;
+    }
+
+    struct Summary {
+        double mean_ms{};
+        double p50_ms{};
+        double p95_ms{};
+        double p99_ms{};
+        double max_ms{};
+        u64 over_50_ms{};
+        u64 over_100_ms{};
+    };
+
+    Summary Summarize() const {
+        if (count == 0) {
+            return {};
+        }
+        auto sorted = intervals_ns;
+        std::sort(sorted.begin(), sorted.begin() + count);
+        u64 sum{}, over_50{}, over_100{};
+        for (size_t i = 0; i < count; ++i) {
+            sum += sorted[i];
+            over_50 += sorted[i] > 50'000'000;
+            over_100 += sorted[i] > 100'000'000;
+        }
+        const auto percentile = [&](size_t percent) {
+            return sorted[(count * percent + 99) / 100 - 1] / 1e6;
+        };
+        return {static_cast<double>(sum) / count / 1e6, percentile(50), percentile(95),
+                percentile(99), sorted[count - 1] / 1e6, over_50, over_100};
     }
 };
 

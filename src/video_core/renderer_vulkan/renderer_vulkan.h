@@ -72,6 +72,7 @@ public:
 
 private:
     Common::DkbFrameTrace::RateLimit trace_cpu_rate;
+    Common::DkbFrameTrace::FrameTimeWindow trace_frame_window;
     std::chrono::steady_clock::time_point trace_last_frame{};
     u64 trace_frame{};
 
@@ -80,6 +81,7 @@ private:
     VkCommandBuffer BeginSingleTimeCommands();
     void EndSingleTimeCommands(VkCommandBuffer command_buffer);
     void Report() const;
+    void ReportFrameTimingWindow(bool partial);
 
     vk::Buffer RenderToBuffer(std::span<const Tegra::FramebufferConfig> framebuffers,
                               const Layout::FramebufferLayout& layout, VkFormat format,

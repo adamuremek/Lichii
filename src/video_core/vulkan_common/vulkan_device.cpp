@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
@@ -441,7 +442,31 @@ VKAPI_ATTR VkResult VKAPI_CALL TimedAllocateMemory(VkDevice device,
                                                    VkDeviceMemory* memory) {
     using namespace VideoCommon::StutterTrace;
     const SiteScope site{Site::MemoryAllocate};
-    return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    if (!Enabled()) {
+        return g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const VkResult result = g_vma_allocate_memory(device, allocate_info, allocator, memory);
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+            .count();
+    // Which allocations make loading frames long: their size, type and whether they are an
+    // image's or buffer's own memory.
+    static std::atomic<u32> logged{};
+    if (ms >= 4.0 && logged.fetch_add(1, std::memory_order_relaxed) < 512) {
+        const char* dedicated = "block";
+        for (auto* next = static_cast<const VkBaseInStructure*>(allocate_info->pNext); next;
+             next = next->pNext) {
+            if (next->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO) {
+                const auto* info = reinterpret_cast<const VkMemoryDedicatedAllocateInfo*>(next);
+                dedicated = info->image ? "dedicated image" : "dedicated buffer";
+            }
+        }
+        LOG_INFO(Render_Vulkan, "Slow device memory allocate: {:.1f} MiB, type {}, {}, {:.1f} ms",
+                 static_cast<double>(allocate_info->allocationSize) / (1 << 20),
+                 allocate_info->memoryTypeIndex, dedicated, ms);
+    }
+    return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL TimedFreeMemory(VkDevice device, VkDeviceMemory memory,
@@ -881,6 +906,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     vk::Check(vmaCreateAllocator(&allocator_info, &allocator));
     vk::ImageRecycler::Open(allocator);
+    if (LargeImagePoolBlockSize() != 0 || std::getenv("EDEN_NX2_STAGING_KEEP_MIB")) {
+        const char* keep = std::getenv("EDEN_NX2_STAGING_KEEP_MIB");
+        LOG_INFO(Render_Vulkan, "Allocation experiments: large image pool {} MiB, staging keep {}",
+                 LargeImagePoolBlockSize() >> 20, keep ? keep : "off");
+    }
 
     owns_static_pipeline_cache = surface != VkSurfaceKHR{};
     LoadStaticPipelineCache();
@@ -908,6 +938,17 @@ Device::~Device() {
     vmaDestroyAllocator(allocator);
 }
 
+VkDeviceSize Device::LargeImagePoolBlockSize() {
+    static const VkDeviceSize size = [] {
+        const char* value = std::getenv("EDEN_NX2_LARGE_IMAGE_POOL_MIB");
+        const u64 mib = value ? std::strtoull(value, nullptr, 10) : 0;
+        // Only blocks larger than the default ones change anything.
+        return mib > (SeparatePoolBlockSize >> 20) && mib <= 1024 ? VkDeviceSize{mib} << 20
+                                                                   : VkDeviceSize{0};
+    }();
+    return size;
+}
+
 VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
@@ -915,7 +956,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::LargeImages ? LargeImagePoolBlockSize()
+                                                           : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,

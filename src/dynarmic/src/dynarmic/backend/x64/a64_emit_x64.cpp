@@ -8,6 +8,8 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <vector>
+
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include "common/assert.h"
@@ -163,6 +165,14 @@ finish_this_inst:
     block_ranges.AddRange(range, descriptor);
 
     auto bdesc = RegisterBlock(descriptor, entrypoint, size);
+    if (PerfMapCodeEnabled()) [[unlikely]] {
+        std::vector<u32> guest_words;
+        for (u64 pc = descriptor.PC(); pc < end_location.PC() && guest_words.size() < 4096;
+             pc += 4) {
+            guest_words.push_back(conf.callbacks->MemoryReadCode(pc).value_or(0));
+        }
+        PerfMapRecordCode(entrypoint, size, descriptor.PC(), guest_words);
+    }
     code.DisableWriting();
     shared_labels.clear();
     return bdesc;

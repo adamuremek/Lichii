@@ -514,6 +514,60 @@ void TextureCache<P>::TickFrame() {
     // EDEN_NX2_MEM_TRACE=1: every 2 s, what the cache holds next to what the process and the
     // driver report (memory climbs).
     static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    if (mem_trace) {
+        // A frame that made many images (some ten is usual): what they are, at most 40 times.
+        static u64 created_before{};
+        static u64 burst_frame{};
+        static u32 bursts_logged{};
+        const u64 created = images_created >= created_before ? images_created - created_before
+                                                             : images_created;
+        created_before = images_created;
+        if (created >= 40 && bursts_logged < 40 && frame_tick - burst_frame >= 10) {
+            burst_frame = frame_tick;
+            ++bursts_logged;
+            struct Shape {
+                u32 count{};
+                u32 gpu_written{};
+                u64 bytes{};
+                GPUVAddr first{~GPUVAddr{0}};
+                GPUVAddr last{};
+            };
+            std::map<std::tuple<u32, u32, u32, u32, u32>, Shape> shapes;
+            size_t live{};
+            for (const auto [image_id, image] : slot_images) {
+                ++live;
+                if (image->allocation_tick + 1 < frame_tick) {
+                    continue;
+                }
+                Shape& shape = shapes[{static_cast<u32>(image->info.format), image->info.size.width,
+                                       image->info.size.height, image->info.size.depth,
+                                       static_cast<u32>(image->info.resources.layers)}];
+                ++shape.count;
+                shape.gpu_written += True(image->flags & ImageFlagBits::GpuModified) ? 1 : 0;
+                shape.bytes += GetScaledImageSizeBytes(*image);
+                shape.first = (std::min)(shape.first, image->gpu_addr);
+                shape.last = (std::max)(shape.last, image->gpu_addr);
+            }
+            std::vector<std::pair<std::tuple<u32, u32, u32, u32, u32>, Shape>> ordered(
+                shapes.begin(), shapes.end());
+            std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+                return a.second.bytes > b.second.bytes;
+            });
+            std::string text;
+            for (size_t i = 0; i < ordered.size() && i < 14; ++i) {
+                const auto& [key, shape] = ordered[i];
+                text += fmt::format(" | format {} {}x{}x{} layers {}: {} ({} GPU-written) {} MiB at "
+                                    "{:#x}..{:#x}",
+                                    std::get<0>(key), std::get<1>(key), std::get<2>(key),
+                                    std::get<3>(key), std::get<4>(key), shape.count,
+                                    shape.gpu_written, shape.bytes >> 20, shape.first, shape.last);
+            }
+            LOG_INFO(HW_GPU,
+                     "Image burst: frame {} made {} images ({} live, {} shapes in the last two "
+                     "frames){}",
+                     frame_tick, created, live, shapes.size(), text);
+        }
+    }
     if (const auto now = std::chrono::steady_clock::now();
         mem_trace && now - mem_trace_time >= std::chrono::seconds{2}) {
         mem_trace_time = now;

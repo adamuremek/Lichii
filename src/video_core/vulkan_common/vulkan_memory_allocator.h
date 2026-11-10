@@ -177,6 +177,12 @@ namespace Vulkan {
         VkResult AllocateImage(const VkImageCreateInfo &ci, bool dedicated, bool may_fail,
                                vk::Image &image) const;
 
+        /// An image over half a default block in the LargeImages pool; false when it is off,
+        /// doesn't apply or failed.
+        bool CreateImageInLargePool(const VkImageCreateInfo &ci,
+                                    const VmaAllocationCreateInfo &alloc_ci, VkImage &handle,
+                                    VmaAllocation &allocation, VmaAllocationInfo &alloc_info) const;
+
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.

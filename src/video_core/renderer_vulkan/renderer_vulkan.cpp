@@ -212,6 +212,9 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
+    if (Common::DkbFrameTrace::Enabled()) {
+        ReportFrameTimingWindow(true);
+    }
     scheduler.RegisterOnSubmit([] {});
     void(device.GetLogical().WaitIdle());
 }
@@ -303,8 +306,28 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                      ms(end - entered), ms(acquiring - entered), ms(acquired - acquiring),
                      ms(presenting - acquired), ms(presented - presenting), ms(end - presented));
         }
+        if (trace_last_frame != std::chrono::steady_clock::time_point{} &&
+            trace_frame_window.Add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      entered - trace_last_frame).count()))) {
+            ReportFrameTimingWindow(false);
+        }
         trace_last_frame = entered;
     }
+}
+
+void RendererVulkan::ReportFrameTimingWindow(bool partial) {
+    if (trace_frame_window.count == 0) {
+        return;
+    }
+    const auto summary = trace_frame_window.Summarize();
+    LOG_INFO(Render_Vulkan,
+             "Frame timing window renderer_frame={} samples={} partial={} mean_ms={:.3f} "
+             "p50_ms={:.3f} p95_ms={:.3f} p99_ms={:.3f} max_ms={:.3f} "
+             "over_50_ms={} over_100_ms={} interval=renderer_composite_entry",
+             trace_frame, trace_frame_window.count, partial, summary.mean_ms, summary.p50_ms,
+             summary.p95_ms, summary.p99_ms, summary.max_ms, summary.over_50_ms,
+             summary.over_100_ms);
+    trace_frame_window.count = 0;
 }
 
 void RendererVulkan::Report() const {

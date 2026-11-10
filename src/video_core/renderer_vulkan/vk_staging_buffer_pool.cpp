@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -312,10 +313,18 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
     constexpr size_t KeepMaxLog2 = 25;
     constexpr size_t KeepPerLevel = 2;
-    if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
+    // EDEN_NX2_STAGING_KEEP_MIB experiment: also keep one idle upload buffer per level up to
+    // that size, so a loading burst's texture uploads over 32 MiB reuse them.
+    static const size_t keep_large_log2 = [] {
+        const char* value = std::getenv("EDEN_NX2_STAGING_KEEP_MIB");
+        const u64 mib = value ? std::strtoull(value, nullptr, 10) : 0;
+        return mib > 32 && mib <= 1024 ? Common::Log2Ceil<u64>(mib << 20) : size_t{0};
+    }();
+    const size_t keep_per_level = log2 <= KeepMaxLog2 ? KeepPerLevel : 1;
+    if (&cache == &upload_cache && (log2 <= KeepMaxLog2 || log2 <= keep_large_log2)) {
         size_t idle = 0;
-        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
-            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        std::erase_if(entries, [this, &idle, keep_per_level](const StagingBuffer& entry) {
+            return scheduler.IsFree(entry.tick) && ++idle > keep_per_level;
         });
         staging.delete_index = 0;
         if (staging.iterate_index > entries.size()) {

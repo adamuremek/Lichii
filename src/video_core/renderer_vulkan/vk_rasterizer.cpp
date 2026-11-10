@@ -607,8 +607,9 @@ void RasterizerVulkan::ReportFastDraws() {
     if (now - stats.window_start < 10'000'000'000ULL) {
         return;
     }
-    // Logged only with EDEN_NX2_GPU_PROFILE or EDEN_NX2_FAST_DRAW_VERIFY.
-    if (!VideoCommon::Nx2Profile::Enabled() && !fast_draw_verify) {
+    // Stutter tracing keeps these counters without disabling fast Maxwell command processing.
+    if (!VideoCommon::Nx2Profile::Enabled() && !VideoCommon::StutterTrace::Enabled() &&
+        !fast_draw_verify) {
         stats = FastDrawStats{.window_start = now};
         return;
     }

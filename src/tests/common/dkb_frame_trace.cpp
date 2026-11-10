@@ -33,3 +33,24 @@ TEST_CASE("DKB GPU timestamp differences respect valid bits", "[common][dkb_fram
     REQUIRE(TimestampDelta(0, 1, 0) == 0);
     REQUIRE(TimestampDelta(0, 1, 65) == 0);
 }
+
+TEST_CASE("Frame timing windows retain rare long frames and exact nearest-rank quantiles",
+          "[common][dkb_frame_trace]") {
+    Common::DkbFrameTrace::FrameTimeWindow window;
+    REQUIRE(window.Summarize().max_ms == 0.0);
+    for (u64 i = 1; i <= window.Capacity; ++i) {
+        REQUIRE(window.Add(i * 1'000'000) == (i == window.Capacity));
+    }
+    const auto summary = window.Summarize();
+    REQUIRE(summary.mean_ms == 150.5);
+    REQUIRE(summary.p50_ms == 150.0);
+    REQUIRE(summary.p95_ms == 285.0);
+    REQUIRE(summary.p99_ms == 297.0);
+    REQUIRE(summary.max_ms == 300.0);
+    REQUIRE(summary.over_50_ms == 250);
+    REQUIRE(summary.over_100_ms == 200);
+    window.count = 0;
+    window.Add(1'000'000'000);
+    REQUIRE(window.Summarize().p99_ms == 1000.0);
+    REQUIRE(window.Summarize().over_100_ms == 1);
+}

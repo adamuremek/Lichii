@@ -267,8 +267,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     }
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    if (!huge) {
+        result = !dedicated && CreateImageInLargePool(ci, alloc_ci, handle, allocation, alloc_info)
+                     ? VK_SUCCESS
+                     : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
@@ -356,6 +360,50 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
         image.SetRecycleKey(recycle_key);
     }
     return VK_SUCCESS;
+}
+
+bool MemoryAllocator::CreateImageInLargePool(const VkImageCreateInfo& ci,
+                                             const VmaAllocationCreateInfo& alloc_ci,
+                                             VkImage& handle, VmaAllocation& allocation,
+                                             VmaAllocationInfo& alloc_info) const {
+    // EDEN_NX2_LARGE_IMAGE_POOL_MIB: images over half a default block share larger blocks instead
+    // of each taking its own memory from the driver.
+    const VkDeviceSize block_size = Device::LargeImagePoolBlockSize();
+    if (block_size == 0) {
+        return false;
+    }
+    const auto& dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    VkImage image{};
+    if (dld.vkCreateImage(logical, &ci, nullptr, &image) != VK_SUCCESS) {
+        return false;
+    }
+    VkMemoryRequirements requirements{};
+    dld.vkGetImageMemoryRequirements(logical, image, &requirements);
+    u32 memory_type{};
+    VmaPool pool{};
+    if (requirements.size > Device::SeparatePoolBlockSize / 2 &&
+        requirements.size <= block_size / 2 &&
+        vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &memory_type) ==
+            VK_SUCCESS &&
+        (requirements.memoryTypeBits & (1u << memory_type)) != 0 &&
+        (pool = device.GetSeparatePool(Device::SeparatePool::LargeImages, memory_type)) !=
+            VK_NULL_HANDLE) {
+        VmaAllocationCreateInfo pool_ci = alloc_ci;
+        pool_ci.pool = pool;
+        pool_ci.memoryTypeBits = 0;
+        if (vmaAllocateMemoryForImage(allocator, image, &pool_ci, &allocation, &alloc_info) ==
+            VK_SUCCESS) {
+            if (vmaBindImageMemory(allocator, allocation, image) == VK_SUCCESS) {
+                handle = image;
+                return true;
+            }
+            vmaFreeMemory(allocator, allocation);
+            allocation = VK_NULL_HANDLE;
+        }
+    }
+    dld.vkDestroyImage(logical, image, nullptr);
+    return false;
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased) const {
