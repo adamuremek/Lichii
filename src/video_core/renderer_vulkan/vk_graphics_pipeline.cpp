@@ -450,35 +450,59 @@ GraphicsPipeline::GraphicsPipeline(
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         const Shader::Info& info = stage_infos[stage];
         u32& handles = handle_constant_buffers[stage];
-        for (const auto& desc : info.texture_buffer_descriptors) {
+        auto& ranges = handle_ranges[stage];
+        std::array<boost::container::small_vector<std::pair<u32, u32>, 8>,
+                   Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers>
+            words;
+        const auto add_range = [&](u32 slot, u32 begin, u32 end) {
+            handles |= 1U << slot;
+            auto& range = ranges[slot];
+            range = range.first == range.second
+                        ? std::pair{begin, end}
+                        : std::pair{(std::min)(range.first, begin), (std::max)(range.second, end)};
+            words[slot].emplace_back(begin, end);
+        };
+        // The words read_handle reads. Handles computed at draw time neither block delta draws
+        // nor take part: ComputedHandlesChanged evaluates them again for each delta draw, from
+        // the constant buffers bound and the data in memory then.
+        const auto add = [&](const auto& desc) {
             if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
+                return;
             }
-            handles |= 1U << desc.cbuf_index;
-            if (desc.has_secondary) {
-                handles |= 1U << desc.secondary_cbuf_index;
+            const u32 last = ((std::max)(desc.count, 1U) - 1) << desc.size_shift;
+            add_range(desc.cbuf_index, desc.cbuf_offset, desc.cbuf_offset + last + 4);
+            if constexpr (requires { desc.has_secondary; }) {
+                if (desc.has_secondary) {
+                    add_range(desc.secondary_cbuf_index, desc.secondary_cbuf_offset,
+                              desc.secondary_cbuf_offset + 4);
+                }
             }
+        };
+        for (const auto& desc : info.texture_buffer_descriptors) {
+            add(desc);
         }
         for (const auto& desc : info.image_buffer_descriptors) {
-            if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
-            }
-            handles |= 1U << desc.cbuf_index;
+            add(desc);
         }
         for (const auto& desc : info.texture_descriptors) {
-            if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
-            }
-            handles |= 1U << desc.cbuf_index;
-            if (desc.has_secondary) {
-                handles |= 1U << desc.secondary_cbuf_index;
-            }
+            add(desc);
         }
         for (const auto& desc : info.image_descriptors) {
-            if (desc.handle_program != ~0U) {
-                block(DeltaBlocker::ComputedHandles);
+            add(desc);
+        }
+        for (u32 slot = 0; slot < words.size(); ++slot) {
+            auto& list = words[slot];
+            std::ranges::sort(list);
+            const size_t first = handle_words.size();
+            for (const auto& range : list) {
+                if (handle_words.size() != first && range.first <= handle_words.back().second) {
+                    handle_words.back().second = (std::max)(handle_words.back().second, range.second);
+                } else {
+                    handle_words.push_back(range);
+                }
             }
-            handles |= 1U << desc.cbuf_index;
+            handle_word_index[stage][slot] = {static_cast<u16>(first),
+                                              static_cast<u16>(handle_words.size() - first)};
         }
     }
 
@@ -655,6 +679,7 @@ template <typename Spec>
 bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     boost::container::small_vector<VideoCommon::ImageViewInOut, 160> views;
     boost::container::small_vector<VideoCommon::SamplerId, 96> samplers;
+    boost::container::small_vector<ComputedHandle, 16> computed_handles;
     views.reserve(num_image_elements);
     samplers.reserve(num_textures);
 
@@ -729,30 +754,52 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     const auto config_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         const Shader::Info& info{stage_infos[stage]};
-        buffer_cache.UnbindGraphicsStorageBuffers(stage);
-        if constexpr (Spec::has_storage_buffers) {
-            size_t ssbo_index{};
-            for (const auto& desc : info.storage_buffers_descriptors) {
-                ASSERT(desc.count == 1);
-                buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
-                                                       desc.cbuf_offset, desc.is_written,
-                                                       desc.indirect_offset);
-                ++ssbo_index;
+        {
+            const Profile::FineScope storage_scope{Profile::Zone::StorageBindings};
+            buffer_cache.UnbindGraphicsStorageBuffers(stage);
+            if constexpr (Spec::has_storage_buffers) {
+                size_t ssbo_index{};
+                for (const auto& desc : info.storage_buffers_descriptors) {
+                    ASSERT(desc.count == 1);
+                    buffer_cache.BindGraphicsStorageBuffer(stage, ssbo_index, desc.cbuf_index,
+                                                           desc.cbuf_offset, desc.is_written,
+                                                           desc.indirect_offset);
+                    ++ssbo_index;
+                }
             }
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
             if (desc.handle_program != ~0U) {
                 // Read by the shader from a storage buffer: computed for this draw.
-                return TexturePair(VideoCommon::EvaluateTextureHandle(
-                                       info, desc.handle_program, *gpu_memory,
-                                       [&](u32 cbuf) -> GPUVAddr {
-                                           return cbuf < cbufs.size() && cbufs[cbuf].enabled
-                                                      ? cbufs[cbuf].address
-                                                      : GPUVAddr{};
-                                       },
-                                       device.GetStorageBufferAlignment()),
-                                   via_header_index);
+                const u32 value{VideoCommon::EvaluateTextureHandle(
+                    info, desc.handle_program, *gpu_memory,
+                    [&](u32 cbuf) -> GPUVAddr {
+                        return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                          : GPUVAddr{};
+                    },
+                    device.GetStorageBufferAlignment())};
+                using Desc = std::remove_cvref_t<decltype(desc)>;
+                const auto [kind, first] = [&]() -> std::pair<ComputedHandleKind, const Desc*> {
+                    if constexpr (std::is_same_v<Desc, Shader::TextureBufferDescriptor>) {
+                        return {TextureBuffer, info.texture_buffer_descriptors.data()};
+                    } else if constexpr (std::is_same_v<Desc, Shader::ImageBufferDescriptor>) {
+                        return {ImageBuffer, info.image_buffer_descriptors.data()};
+                    } else if constexpr (std::is_same_v<Desc, Shader::TextureDescriptor>) {
+                        return {Texture, info.texture_descriptors.data()};
+                    } else {
+                        return {Image, info.image_descriptors.data()};
+                    }
+                }();
+                const ComputedHandle computed{static_cast<u8>(stage), kind,
+                                              static_cast<u16>(&desc - first), value};
+                // An array's elements all evaluate the same program: one entry per descriptor.
+                if (computed_handles.empty() || computed_handles.back().stage != computed.stage ||
+                    computed_handles.back().kind != computed.kind ||
+                    computed_handles.back().descriptor != computed.descriptor) {
+                    computed_handles.push_back(computed);
+                }
+                return TexturePair(value, via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
             const u32 index_offset{index << desc.size_shift};
@@ -838,6 +885,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
             config_stage(4);
         }
     }
+    Profile::AddFine(Profile::FineCounter::TextureHandles, views.size());
     ASSERT(views.size() == num_image_elements);
     ASSERT(samplers.size() == num_textures);
     if (resolve_in_full) {
@@ -926,6 +974,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         delta_views.assign(views.begin(), views.end());
         delta_samplers.assign(samplers.begin(), samplers.end());
+        delta_computed_handles.assign(computed_handles.begin(), computed_handles.end());
         configured_stages = Spec::enabled_stages;
         delta_views_valid = true;
         kept_images_valid = false;
@@ -1018,6 +1067,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        const Profile::FineScope geometry_scope{Profile::Zone::GeometryBuffers};
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
 
@@ -1115,6 +1165,40 @@ bool GraphicsPipeline::DeltaImagesChange() const noexcept {
     return texture_cache.SampledViewsChange(delta_views);
 }
 
+bool GraphicsPipeline::ComputedHandlesChanged() const {
+    for (const ComputedHandle& handle : delta_computed_handles) {
+        const Shader::Info& info{stage_infos[handle.stage]};
+        const auto& cbufs{maxwell3d->state.shader_stages[handle.stage].const_buffers};
+        u32 program{};
+        switch (handle.kind) {
+        case TextureBuffer:
+            program = info.texture_buffer_descriptors[handle.descriptor].handle_program;
+            break;
+        case ImageBuffer:
+            program = info.image_buffer_descriptors[handle.descriptor].handle_program;
+            break;
+        case Texture:
+            program = info.texture_descriptors[handle.descriptor].handle_program;
+            break;
+        default:
+            program = info.image_descriptors[handle.descriptor].handle_program;
+            break;
+        }
+        // As ConfigureImpl's read_handle computes it.
+        const u32 value{VideoCommon::EvaluateTextureHandle(
+            info, program, *gpu_memory,
+            [&](u32 cbuf) -> GPUVAddr {
+                return cbuf < cbufs.size() && cbufs[cbuf].enabled ? cbufs[cbuf].address
+                                                                  : GPUVAddr{};
+            },
+            device.GetStorageBufferAlignment())};
+        if (value != handle.value) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     namespace Profile = VideoCommon::Nx2Profile;
     // ConfigureImpl without reading handles and resolving image views, samplers and texture
@@ -1178,7 +1262,9 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
         if (replay_images) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const auto [first, count] = kept_image_ranges[stage];
-            guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
+            if (count != 0) {
+                guest_descriptor_queue.AddEntries({kept_image_entries.data() + first, count});
+            }
         } else {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             const size_t first_entry = guest_descriptor_queue.UpdateCount();

@@ -128,9 +128,11 @@ public:
     DescriptorTable<TICEntry, ImageViewId> compute_image_table;
     DescriptorTable<TSCEntry, SamplerId> compute_sampler_table;
 
-    // TODO: still relies on bad iterators :(
-    std::unordered_map<TICEntry, ImageViewId> image_views;
-    std::unordered_map<TSCEntry, SamplerId> samplers;
+    // Flat maps, like the other hot texture cache maps: VisitImageView holds the try_emplace
+    // iterator across CreateImageView, which only erases from image_views (erasing never
+    // rehashes, and never removes the new entry: its id is still 0) and never inserts.
+    ::Common::unordered_map<TICEntry, ImageViewId> image_views;
+    ::Common::unordered_map<TSCEntry, SamplerId> samplers;
 
     TextureCacheGPUMap* gpu_page_table = nullptr;
     TextureCacheGPUMap* sparse_page_table = nullptr;
@@ -174,6 +176,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 native_critical_memory{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
+    u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit

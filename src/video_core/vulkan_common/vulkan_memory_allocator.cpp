@@ -256,6 +256,15 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
+    // An image of the same create info released before is taken from the recycler instead
+    // (vk::ImageRecycler).
+    const u64 recycle_key = vk::ImageRecycler::KeyOf(ci, dedicated);
+    if (recycle_key != 0 && vk::ImageRecycler::Take(recycle_key, allocator, handle, allocation)) {
+        image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
+                          device.GetDispatchLoader());
+        image.SetRecycleKey(recycle_key);
+        return VK_SUCCESS;
+    }
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > MaxBackedImageTexels;
     VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
@@ -315,6 +324,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     if (result != VK_SUCCESS) {
         failed_images.fetch_add(1, std::memory_order_relaxed);
         static u32 failed_logged{};
+        if (failed_logged == 0) {
+            // What ran out: the device's heaps or the host's commit. Before the error line,
+            // which is the one that reaches the log file when the session ends here.
+            LogMemoryTrace(device);
+        }
         if (failed_logged++ < 32) {
             LOG_ERROR(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
                       ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
@@ -335,6 +349,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
 
     image = vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
                       device.GetDispatchLoader());
+    // Images placed in host memory under memory pressure are freed rather than kept.
+    if (recycle_key != 0 && alloc_info.memoryType < properties.memoryTypeCount &&
+        (properties.memoryTypes[alloc_info.memoryType].propertyFlags &
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+        image.SetRecycleKey(recycle_key);
+    }
     return VK_SUCCESS;
 }
 

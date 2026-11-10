@@ -108,6 +108,7 @@ public:
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void FlushRegionForRead(DAddr addr, u64 size) override;
     void FinishRead(DAddr addr, u64 size) override;
+    void TraceRead(VideoCommon::ReadTrace::Read& read, VideoCommon::ReadTrace::Step step) override;
     bool NoteReportPending(DAddr addr, u64 size) override;
     void FinishReport(DAddr addr, u64 size) override;
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
@@ -115,6 +116,14 @@ public:
     bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
+    bool Nx2ListSlotsSupported() const override;
+    std::optional<u32> Nx2AcquireListSlot() override;
+    void Nx2ReleaseListSlot(u32 slot) override;
+    void Nx2SnapshotListWords(DAddr device_addr, u32 count, u32 slot) override;
+    void Nx2NoteOwedListWord(DAddr device_addr, u32 value) override;
+    void Nx2NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) override;
+    void Nx2ReadListSlots(std::span<const u32> slots, std::span<u32> words) override;
+    void Nx2CheckListSlot(u32 slot, std::span<const u32> words) override; // TEST
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -404,6 +413,8 @@ private:
         HandleBind,
         HandleData,
         SampledImages,
+        ComputedHandles,
+        VertexInput,
         Count,
     };
     /// Why a recorded draw can't be followed by a delta draw.
