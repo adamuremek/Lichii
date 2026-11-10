@@ -1615,6 +1615,7 @@ struct ListCallContext {
         emit(method, value);
     }
     void SendOwed(u64 device, u32 value) const {
+        GetFrontQmd().TaintUploads(split);
         split.Defer([rasterizer_ = rasterizer, device,
                      value] { rasterizer_->Nx2NoteOwedListWord(device, value); },
                     VideoCommon::GpuSplit::Writes::Noted);
@@ -1659,6 +1660,19 @@ struct KeplerCompute::FrontState {
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
     /// The inline upload the back runs, where a word of it lands (Nx2ListIndirect).
     Nx2ListIndirect::UploadState upload;
+    /// A linear one-line inline upload into a single QMD, for the QMD view
+    /// (FrontQmdView::NoteUploadedQmd): its bytes as the data words arrive.
+    struct QmdUpload {
+        bool tracked{};
+        GPUVAddr address{};
+        u32 size{};
+        u32 received{};
+        u64 prior{};      ///< The last write sent to the QMD before the upload
+        u64 started{};    ///< The position after exec_upload
+        u64 last_noted{}; ///< The last write sent to the QMD once a data method was noted
+        std::array<u8, 256> bytes{};
+    };
+    mutable QmdUpload qmd_upload;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1726,6 +1740,12 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     }
     Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument,
                                       [&fs](u32 reg) { return fs.registers[reg]; });
+    if (auto& upload = fs.qmd_upload;
+        method == Nx2ListIndirect::UploadData && upload.tracked && upload.received < upload.size) {
+        const u32 count = (std::min)(4U, upload.size - upload.received);
+        std::memcpy(upload.bytes.data() + upload.received, &argument, count);
+        upload.received += count;
+    }
     fs.registers[method] = argument;
     switch (method) {
     case 0x45:
@@ -1845,6 +1865,28 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontSta
     case 0x107:
         FrontInlineQmd(split, fs, argument);
         break;
+    case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
+        // An upload of one line into a single QMD: the front keeps its bytes for the QMD view.
+        Upload::Registers upload;
+        std::memcpy(&upload, fs.registers.data() + KEPLER_COMPUTE_REG_INDEX(upload),
+                    sizeof(upload));
+        auto& tracked = fs.qmd_upload;
+        const GPUVAddr address = upload.dest.Address();
+        const GPUVAddr qmd = address & ~GPUVAddr{0xff};
+        const u32 size = upload.line_length_in;
+        tracked.tracked = (argument & 1) != 0 && upload.line_count == 1 && size != 0 &&
+                          address - qmd + size <= tracked.bytes.size() &&
+                          memory_manager.IsFullyMappedRange(qmd, tracked.bytes.size());
+        if (tracked.tracked) {
+            tracked.address = address;
+            tracked.size = size;
+            tracked.received = 0;
+            tracked.prior = split.MemoryWritesTarget(memory_manager, qmd, tracked.bytes.size());
+            tracked.started = split.Position();
+            tracked.last_noted = tracked.prior;
+        }
+        break;
+    }
     case KEPLER_COMPUTE_REG_INDEX(data_upload): {
         // Upload::State::ProcessData, of the upload exec_upload started: the whole of it at each
         // data method, at most.
@@ -1853,7 +1895,31 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontSta
                     sizeof(upload));
         const bool linear = (fs.registers[KEPLER_COMPUTE_REG_INDEX(exec_upload)] & 1) != 0;
         const auto range = Upload::UploadedRange(upload, linear);
+        auto& tracked = fs.qmd_upload;
+        const GPUVAddr qmd = tracked.address & ~GPUVAddr{0xff};
+        // Only the upload's own words may have written the QMD since exec_upload.
+        if (tracked.tracked &&
+            (range.address != tracked.address || range.size != tracked.size ||
+             split.MemoryWritesTarget(memory_manager, qmd, tracked.bytes.size()) !=
+                 tracked.last_noted)) {
+            tracked.tracked = false;
+        }
         split.NoteWrite(memory_manager, range.address, range.size);
+        if (!tracked.tracked) {
+            break;
+        }
+        tracked.last_noted = split.MemoryWritesTarget(memory_manager, qmd, tracked.bytes.size());
+        if (tracked.received < tracked.size) {
+            break;
+        }
+        tracked.tracked = false;
+        const auto device = memory_manager.GpuToCpuAddress(qmd);
+        if (device && tracked.last_noted == split.Position() &&
+            !GetFrontQmd().UploadsTaintedSince(tracked.started)) {
+            GetFrontQmd().NoteUploadedQmd(split, FrontQmdMemory{memory_manager}, qmd, *device,
+                                          static_cast<u32>(tracked.address - qmd),
+                                          tracked.bytes.data(), tracked.size, tracked.prior);
+        }
         break;
     }
     case 0xae:

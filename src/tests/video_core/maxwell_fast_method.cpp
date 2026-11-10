@@ -1740,4 +1740,50 @@ TEST_CASE("Split front values the releases of the QMD launches it sends as the b
     CHECK_FALSE(queued(0x40).has_value());
     Access::RunBack(split);
     CHECK(word(0x40) == 3);
+
+    // A waiting QMD rewritten by a linear inline upload still queued when its decrement is sent
+    // (Ocarina of Time): the front has the upload's words, the launch is valued at once.
+    const auto upload_qmd = [&](GPUVAddr address, const Descriptor& qmd) {
+        std::memcpy(pages.backing + (address - MappedPages::gpu_address), qmd.data(), sizeof(qmd));
+        send(0x60, sizeof(qmd));
+        send(0x61, 1);
+        send(0x62, static_cast<u32>(address >> 32));
+        send(0x63, static_cast<u32>(address));
+        send(0x6c, 1);
+        for (const u32 data : qmd) {
+            send(0x6d, data);
+        }
+    };
+    inline_qmd(qmds + 0x800, make_qmd(1, 0x50, Enable | OneWord, 3), false);
+    Access::RunBack(split);
+    upload_qmd(qmds + 0x800, make_qmd(1, 0x50, Enable | OneWord, 11));
+    send(0xad, static_cast<u32>((qmds + 0x800) >> 8));
+    send(0xb0, 7);
+    release = queued(0x50);
+    REQUIRE(release.has_value());
+    CHECK(release->known);
+    CHECK(release->payload == 11);
+    Access::RunBack(split);
+
+    // An upload of a few of its words: the rest is what memory held before it.
+    inline_qmd(qmds + 0x900, make_qmd(1, 0x60, Enable | OneWord, 3), false);
+    Access::RunBack(split);
+    {
+        const GPUVAddr payload_word = qmds + 0x900 + 26 * sizeof(u32);
+        f.memory.Write<u32>(payload_word, 3); // The back's write is the null rasterizer's
+        send(0x60, sizeof(u32));
+        send(0x61, 1);
+        send(0x62, static_cast<u32>(payload_word >> 32));
+        send(0x63, static_cast<u32>(payload_word));
+        send(0x6c, 1);
+        send(0x6d, 21);
+        f.memory.Write<u32>(payload_word, 21);
+    }
+    send(0xad, static_cast<u32>((qmds + 0x900) >> 8));
+    send(0xb0, 7);
+    release = queued(0x60);
+    REQUIRE(release.has_value());
+    CHECK(release->known);
+    CHECK(release->payload == 21);
+    Access::RunBack(split);
 }
