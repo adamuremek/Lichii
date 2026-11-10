@@ -19,6 +19,7 @@ public:
 
 private:
     std::unique_ptr<FileSys::Fsa::IFile> backend;
+    std::string trace_name; ///< The file's path, kept only for EDEN_NX2_FS_READ_TRACE=2.
 
     Result Read(FileSys::ReadOption option, Out<s64> out_size, s64 offset,
                 const OutBuffer<BufferAttr_HipcMapAlias | BufferAttr_HipcMapTransferAllowsNonSecure>

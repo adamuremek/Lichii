@@ -28,6 +28,9 @@ class ServiceThread;
 
 namespace Service {
 
+/// The guest thread whose request this host thread is handling, or nullptr outside a handler.
+Kernel::KThread* CurrentRequestThread();
+
 namespace KernelHelpers {
 class ServiceContext;
 }

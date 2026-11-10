@@ -24,6 +24,7 @@
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/k_thread.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
@@ -184,6 +185,14 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
     }
 }
 
+namespace {
+thread_local Kernel::KThread* t_request_thread{};
+} // namespace
+
+Kernel::KThread* CurrentRequestThread() {
+    return t_request_thread;
+}
+
 void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     auto it = handlers.find(ctx.GetCommand());
     FunctionInfoBase const* info = it == handlers.end() ? nullptr : &it->second;
@@ -196,6 +205,10 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     if (ipc_trace) {
         LOG_INFO(Service, "ipc {}::{} ({})", service_name, ctx.GetCommand(), info->name);
     }
+    t_request_thread = &ctx.GetThread();
+    SCOPE_EXIT {
+        t_request_thread = nullptr;
+    };
     handler_invoker(this, info->handler_callback, ctx);
     if (ipc_trace) {
         // Response layout: [0..1] header, then 'SFCO', version, result.
@@ -225,6 +238,10 @@ void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
         LOG_INFO(Service, "tipc {}::{} ({}) [2]={:#x} [3]={:#x} [4]={:#x}", service_name,
                  ctx.GetCommand(), info->name, w[2], w[3], w[4]);
     }
+    t_request_thread = &ctx.GetThread();
+    SCOPE_EXIT {
+        t_request_thread = nullptr;
+    };
     handler_invoker(this, info->handler_callback, ctx);
 }
 

@@ -54,6 +54,10 @@ Result IStorage::Read(
     // Read the data from the Storage backend
     const ReadTraceScope trace{ReadTraceSource::Storage, length};
     backend->Read(out_bytes.data(), length, offset);
+    if (DetailEnabled()) {
+        RecordDetail(ReadTraceSource::Storage, this, backend->GetName(), static_cast<u64>(offset),
+                     static_cast<u64>(length), &backend);
+    }
 
     R_SUCCEED();
 }

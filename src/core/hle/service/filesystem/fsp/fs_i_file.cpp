@@ -13,6 +13,9 @@ namespace Service::FileSystem {
 
 IFile::IFile(Core::System& system_, FileSys::VirtualFile file_)
     : ServiceFramework{system_, "IFile"}, backend{std::make_unique<FileSys::Fsa::IFile>(file_)} {
+    if (DetailEnabled() && file_) {
+        trace_name = file_->GetFullPath();
+    }
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IFile::Read>, "Read"},
@@ -36,8 +39,13 @@ Result IFile::Read(
 
     // Read the data from the Storage backend
     const ReadTraceScope trace{ReadTraceSource::File, size};
-    R_RETURN(
-        backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));
+    const Result result =
+        backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size);
+    if (DetailEnabled() && result.IsSuccess()) {
+        RecordDetail(ReadTraceSource::File, this, trace_name, static_cast<u64>(offset),
+                     static_cast<u64>(*out_size));
+    }
+    R_RETURN(result);
 }
 
 Result IFile::Write(
