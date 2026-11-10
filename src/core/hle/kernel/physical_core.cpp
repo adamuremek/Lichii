@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
@@ -11,6 +12,7 @@
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
+#include "core/hle/kernel/guest_profile.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
@@ -95,6 +97,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 return;
             }
 
+            if (GuestProfile::Enabled()) {
+                GuestProfile::Enter(GuestProfile::State::Jit);
+            }
             if (thread->GetStepState() == StepState::StepPending) {
                 hr = interface->StepThread(thread);
 
@@ -106,6 +111,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             }
 
             ExitContext();
+            if (GuestProfile::Enabled()) {
+                GuestProfile::Enter(GuestProfile::State::Kernel);
+            }
         }
 
         // Determine why we stopped.
@@ -155,7 +163,20 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // Handle system calls.
         if (supervisor_call) {
             // Perform call.
-            Svc::Call(system, interface->GetSvcNumber());
+            const u32 svc = interface->GetSvcNumber();
+            if (GuestProfile::Enabled()) {
+                u32 slot = svc;
+                if (svc == static_cast<u32>(Svc::SvcId::SleepThread)) {
+                    std::array<u64, 8> args{};
+                    interface->GetSvcArguments(args);
+                    slot = static_cast<s64>(args[0]) <= 0 ? GuestProfile::YieldSlot : svc;
+                }
+                GuestProfile::Enter(GuestProfile::State::Svc, slot);
+            }
+            Svc::Call(system, svc);
+            if (GuestProfile::Enabled()) {
+                GuestProfile::Enter(GuestProfile::State::Kernel);
+            }
             return;
         }
 
@@ -243,6 +264,10 @@ void PhysicalCore::Idle(KernelCore& kernel) {
 #endif
     }
     const auto spin = std::chrono::microseconds{spin_us};
+    const bool profile = GuestProfile::Enabled();
+    if (profile && spin.count() > 0) {
+        GuestProfile::Enter(GuestProfile::State::IdleSpin);
+    }
     if (spin.count() > 0) {
         const auto deadline = std::chrono::steady_clock::now() + spin;
         while (!m_is_interrupted.load(std::memory_order_acquire) &&
@@ -250,8 +275,16 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             std::this_thread::yield();
         }
     }
-    std::unique_lock lk{m_guard};
-    m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+    if (profile) {
+        GuestProfile::Enter(GuestProfile::State::IdleWait);
+    }
+    {
+        std::unique_lock lk{m_guard};
+        m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+    }
+    if (profile) {
+        GuestProfile::Enter(GuestProfile::State::Kernel);
+    }
 }
 
 bool PhysicalCore::IsInterrupted() const {

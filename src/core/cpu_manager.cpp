@@ -12,6 +12,7 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
+#include "core/hle/kernel/guest_profile.h"
 #include "core/hle/kernel/k_interrupt_manager.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_thread.h"
@@ -174,6 +175,9 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     const Common::DkbCpuTrace::Registration cpu_trace{
         is_multicore ? static_cast<Common::DkbCpuTrace::Role>(core)
                      : Common::DkbCpuTrace::Role::GuestSingleCore};
+    if (Kernel::GuestProfile::Enabled()) {
+        Kernel::GuestProfile::SetCore(is_multicore ? static_cast<int>(core) : -1);
+    }
     /// Initialization
     system.RegisterCoreThread(core);
     std::string name = is_multicore ? ("CPUCore_" + std::to_string(core)) : std::string{"CPUThread"};
