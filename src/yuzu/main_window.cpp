@@ -2131,6 +2131,13 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         Settings::UpdateGPUAccuracy();
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
+    if (Settings::ApplyOcarinaOfTimeAsyncDraws(Settings::values, title_id)) {
+        LOG_INFO(Config, "Ocarina of Time: Switch 2 draws with unbuilt pipelines use Bounded for "
+                         "this session{}",
+                 Settings::values.use_asynchronous_shaders.GetValue()
+                     ? ""
+                     : " (no effect: asynchronous shaders are off)");
+    }
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
     Settings::LogSettings();
 
