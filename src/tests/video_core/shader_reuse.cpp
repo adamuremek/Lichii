@@ -11,6 +11,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/vk_shader_reuse.h"
+#include "video_core/shader_environment.h"
 
 namespace {
 
@@ -21,6 +22,7 @@ public:
     bool indirect_pointer{true};
     u32 cbuf_base{};
     bool throws{};
+    bool detached_miss{};
     bool forgot_lacked_reads{};
 
     TestEnvironment() {
@@ -36,6 +38,9 @@ public:
         return pointer;
     }
     bool IsCbufIndirectStorageBufferPointer(u32, u32, u32) override {
+        if (detached_miss) {
+            throw VideoCommon::DetachedEnvironmentMiss{};
+        }
         return indirect_pointer;
     }
     u64 ReadInstruction(u32) override {
@@ -128,6 +133,10 @@ TEST_CASE("Shader reuse matches environments with the same answers", "[shader_re
     throwing.throws = true;
     REQUIRE_FALSE(reads.Matches(throwing));
     REQUIRE(throwing.forgot_lacked_reads);
+
+    TestEnvironment detached = same;
+    detached.detached_miss = true;
+    REQUIRE_FALSE(reads.Matches(detached));
 }
 
 TEST_CASE("Shader reuse cache finds shaders by key and environment", "[shader_reuse]") {

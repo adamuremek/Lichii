@@ -9,6 +9,7 @@
 #include "common/zstd_compression.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/renderer_vulkan/vk_shader_reuse.h"
+#include "video_core/shader_environment.h"
 
 namespace Vulkan {
 
@@ -99,6 +100,8 @@ bool TranslationReads::Matches(Shader::Environment& env) const try {
 } catch (const Shader::Exception&) {
     // A disk cache environment throws when asked what its own translation did not ask.
     env.ForgetLackedReads();
+    return false;
+} catch (const VideoCommon::DetachedEnvironmentMiss&) {
     return false;
 }
 
