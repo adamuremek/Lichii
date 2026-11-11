@@ -1260,6 +1260,9 @@ struct Maxwell3D::FrontState {
     u32 back_escapes_seen{};
     /// EDEN_NX2_PASS_CUTS: the render target registers of the pass being sent.
     std::vector<u32> pass_targets;
+    /// The constant buffer bindings as the back's ProcessCBBind leaves them (Maxwell3D::state),
+    /// for the pass snapshots.
+    State bindings{};
     bool pass_verify_due{};
 };
 
@@ -1440,6 +1443,30 @@ bool NotePassCut(FrontState& fs, bool back_macro) {
              stats.most_owned, registers.empty() ? " none" : registers, stats.verifies);
     stats = Stats{};
     return true;
+}
+
+/// A constant buffer bind (bind_groups[stage].raw_config), as ProcessCBBind runs it on the back.
+template <class FrontState>
+void TrackPassBind(FrontState& fs, u32 method, u32 value) {
+    using Regs = Maxwell3D::Regs;
+    constexpr u32 first = MAXWELL3D_REG_INDEX(bind_groups[0].raw_config);
+    constexpr u32 step = sizeof(Regs::BindGroup) / sizeof(u32);
+    if (method < first || (method - first) % step != 0 ||
+        (method - first) / step >= Regs::MaxShaderStage) {
+        return;
+    }
+    Regs::BindGroup group;
+    group.raw_config = value;
+    if (group.shader_slot >= Regs::MaxConstBuffers) {
+        return;
+    }
+    Regs::ConstantBuffer buffer;
+    std::memcpy(&buffer, &fs.regs[MAXWELL3D_REG_INDEX(const_buffer)],
+                offsetof(Regs::ConstantBuffer, buffer));
+    auto& binding = fs.bindings.shader_stages[(method - first) / step].const_buffers[group.shader_slot];
+    binding.enabled = group.valid.Value() != 0;
+    binding.address = buffer.Address();
+    binding.size = buffer.size;
 }
 
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
@@ -1641,6 +1668,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->regs.data(), regs.reg_array.data(), sizeof(front->regs));
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
+        front->bindings = state;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
         front->split_start = split.Starts();
         front->executing_macro = executing_macro;
@@ -1722,6 +1750,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.regs[method] = value;
     } else {
         fs.regs[method] = value;
+        TrackPassBind(fs, method, value);
         constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
         switch (method) {
         case MAXWELL3D_REG_INDEX(shadow_ram_control):
@@ -1892,6 +1921,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             if (!execution_mask[method]) {
                 continue;
             }
+            TrackPassBind(fs, method, value);
             switch (method) {
             case MAXWELL3D_REG_INDEX(shadow_ram_control):
                 fs.control = static_cast<Regs::ShadowRamControl>(argument);
@@ -2572,19 +2602,22 @@ void Maxwell3D::FrontSendPassSnapshot(VideoCommon::GpuSplit& split, const FrontS
         }
     }
     const bool load = PassSnapshotMode() == 2;
+    auto bindings = std::make_shared<State>(fs.bindings);
     split.DeferFunction(
-        [this, snapshot, unknown, skip, load] {
-            BackPassSnapshot(*snapshot, *unknown, skip, load);
+        [this, snapshot, unknown, bindings, skip, load] {
+            BackPassSnapshot(*snapshot, *unknown, *bindings, skip, load);
         },
         VideoCommon::GpuSplit::Writes::Noted);
 }
 
 void Maxwell3D::BackPassSnapshot(const std::vector<u32>& snapshot,
-                                 const std::vector<u32>& unknown, u32 skip, bool load) {
+                                 const std::vector<u32>& unknown, const State& bindings, u32 skip,
+                                 bool load) {
     struct Stats {
         u64 cuts{};
         u64 differing_cuts{};
         u64 differences{};
+        u64 binding_differences{};
         u64 loaded{};
         std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
     };
@@ -2619,10 +2652,49 @@ void Maxwell3D::BackPassSnapshot(const std::vector<u32>& snapshot,
                         snapshot[i], expected[i]);
         }
     }
-    stats.differing_cuts += differences != 0 ? 1 : 0;
+    // The constant buffer bindings, state the back keeps outside the registers.
+    static u64 total_binding_differences{};
+    u64 binding_differences = 0;
+    for (size_t stage = 0; stage < Regs::MaxShaderStage; ++stage) {
+        for (size_t slot = 0; slot < Regs::MaxConstBuffers; ++slot) {
+            const auto& front_binding = bindings.shader_stages[stage].const_buffers[slot];
+            const auto& back_binding = state.shader_stages[stage].const_buffers[slot];
+            if (front_binding.enabled == back_binding.enabled &&
+                front_binding.address == back_binding.address &&
+                front_binding.size == back_binding.size) {
+                continue;
+            }
+            ++binding_differences;
+            if (logged < 32) {
+                ++logged;
+                LOG_WARNING(HW_GPU,
+                            "Pass snapshot binding stage {} slot {}: front {} {:#x}+{:#x}, back {} "
+                            "{:#x}+{:#x}",
+                            stage, slot, front_binding.enabled, front_binding.address,
+                            front_binding.size, back_binding.enabled, back_binding.address,
+                            back_binding.size);
+            }
+        }
+    }
+    stats.binding_differences += binding_differences;
+    total_binding_differences += binding_differences;
+    stats.differing_cuts += differences != 0 || binding_differences != 0 ? 1 : 0;
     stats.differences += differences;
     total_differences += differences;
     if (load) {
+        // Every binding again, as a pass with no inherited state would make them.
+        state = bindings;
+        for (size_t stage = 0; stage < Regs::MaxShaderStage; ++stage) {
+            for (size_t slot = 0; slot < Regs::MaxConstBuffers; ++slot) {
+                const auto& binding = state.shader_stages[stage].const_buffers[slot];
+                if (binding.enabled) {
+                    rasterizer->BindGraphicsUniformBuffer(stage, static_cast<u32>(slot),
+                                                          binding.address, binding.size);
+                } else {
+                    rasterizer->DisableGraphicsUniformBuffer(stage, static_cast<u32>(slot));
+                }
+            }
+        }
         // The registers the sink still holds are written again when it is consumed.
         for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
             if (!left[i]) {
@@ -2638,10 +2710,12 @@ void Maxwell3D::BackPassSnapshot(const std::vector<u32>& snapshot,
         return;
     }
     LOG_INFO(HW_GPU,
-             "Pass snapshots per second: {:.0f} checked on the back, {:.0f} with a register that "
-             "differs ({:.0f} registers), {:.0f} loaded | {} differing registers since boot",
+             "Pass snapshots per second: {:.0f} checked on the back, {:.0f} that differ ({:.0f} "
+             "registers, {:.0f} constant buffer bindings), {:.0f} loaded | since boot {} differing "
+             "registers, {} differing bindings",
              stats.cuts / seconds, stats.differing_cuts / seconds, stats.differences / seconds,
-             stats.loaded / seconds, total_differences);
+             stats.binding_differences / seconds, stats.loaded / seconds, total_differences,
+             total_binding_differences);
     stats = Stats{};
 }
 
