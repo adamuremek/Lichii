@@ -3246,6 +3246,9 @@ void PipelineCache::TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& ke
         // Shader errors are handled inside; nothing else may fail the job unadopted.
         LOG_ERROR(Render_Vulkan, "Graphics pipeline translation failed: {}", exception.what());
     }
+    for (GraphicsEnvironment& env : envs) {
+        env.DropSnapshot();
+    }
     std::scoped_lock lock{translated_mutex};
     translated_graphics.push_back({
         .key = key,

@@ -229,6 +229,12 @@ public:
     /// Bytes of constant buffer contents copied by Detach (0 if not detached).
     [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;
 
+    /// Frees what Detach copied. Afterwards the environment only holds its recorded answers, for
+    /// the disk cache: it must not be translated again.
+    void DropSnapshot() noexcept {
+        snapshot.reset();
+    }
+
 private:
     /// The 3D engine state a detached environment reads instead of the engine.
     struct EngineSnapshot {
