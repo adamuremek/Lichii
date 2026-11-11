@@ -226,9 +226,10 @@ private:
     /// GPU thread).
     [[nodiscard]] std::optional<u64> DetachGraphicsEnvironments(GraphicsEnvironmentArray& envs);
 
-    /// Queues the translation of graphics_key's pipeline as a shader job and waits for it as
-    /// WaitForGraphicsTranslation does.
-    bool QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 snapshot_bytes);
+    /// Queues the translation of graphics_key's pipeline as a shader job, holding `reservation`
+    /// for its snapshots until it ran, and waits for it as WaitForGraphicsTranslation does.
+    bool QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 snapshot_bytes,
+                                  std::unique_ptr<QueuedIrBudget::Reservation> reservation);
 
     /// Waits for a queued translation as the current draw's pending policy allows: until it is
     /// done for a draw that cannot be skipped, within the native wait budget for a bounded one.

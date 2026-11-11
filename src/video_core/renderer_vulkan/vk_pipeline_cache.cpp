@@ -2147,9 +2147,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::NewGraphicsPipeline() {
         if (pipeline) {
             return pipeline;
         }
-        if (const std::optional<u64> snapshot_bytes{
-                DetachGraphicsEnvironments(environments.envs)}) {
-            if (!QueueGraphicsTranslation(std::move(environments.envs), *snapshot_bytes) ||
+        // Snapshots of queued translations count against queued_ir, as IR waiting for its
+        // SPIR-V does; past it the pipeline is translated here.
+        const std::optional<u64> snapshot_bytes{DetachGraphicsEnvironments(environments.envs)};
+        if (auto reservation = snapshot_bytes ? queued_ir.TryReserve(*snapshot_bytes) : nullptr) {
+            if (!QueueGraphicsTranslation(std::move(environments.envs), *snapshot_bytes,
+                                          std::move(reservation)) ||
                 graphics_cache.contains(graphics_key)) {
                 return nullptr;
             }
@@ -3174,16 +3177,20 @@ std::optional<u64> PipelineCache::DetachGraphicsEnvironments(GraphicsEnvironment
     return snapshot_bytes;
 }
 
-bool PipelineCache::QueueGraphicsTranslation(GraphicsEnvironmentArray envs, u64 snapshot_bytes) {
+bool PipelineCache::QueueGraphicsTranslation(
+    GraphicsEnvironmentArray envs, u64 snapshot_bytes,
+    std::unique_ptr<QueuedIrBudget::Reservation> reservation) {
     const VideoCommon::ShaderJobHandle job{shader_jobs->Submit({
         .priority = VideoCommon::ShaderJobPriority::Soon,
         .cpu_bytes = TranslationBytes(snapshot_bytes),
-        .cpu = [this, key = graphics_key, envs = std::move(envs)](
+        .cpu = [this, key = graphics_key, envs = std::move(envs),
+                reservation = std::move(reservation)](
                    VideoCommon::ShaderJobContext& context) mutable
         -> VideoCommon::ShaderDriverStage {
             if (!context.StopRequested()) {
                 TranslateGraphicsPipeline(key, std::move(envs));
             }
+            reservation.reset();
             return {};
         },
     })};
