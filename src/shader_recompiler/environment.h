@@ -73,7 +73,13 @@ struct ConstBufferAddr {
 
 class Environment {
 public:
+    Environment() = default;
     virtual ~Environment() = default;
+
+    Environment(const Environment&) = default;
+    Environment& operator=(const Environment&) = default;
+    Environment(Environment&&) noexcept = default;
+    Environment& operator=(Environment&&) noexcept = default;
 
     [[nodiscard]] virtual u64 ReadInstruction(u32 address) = 0;
 

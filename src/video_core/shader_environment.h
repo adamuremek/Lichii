@@ -50,6 +50,11 @@ public:
 
     ~GenericEnvironment() override;
 
+    GenericEnvironment(const GenericEnvironment&) = default;
+    GenericEnvironment& operator=(const GenericEnvironment&) = default;
+    GenericEnvironment(GenericEnvironment&&) noexcept = default;
+    GenericEnvironment& operator=(GenericEnvironment&&) noexcept = default;
+
     [[nodiscard]] u32 TextureBoundBuffer() const final;
 
     [[nodiscard]] u32 LocalMemorySize() const final;
@@ -189,6 +194,11 @@ public:
                                  ShaderCacheV2::Cache* cache_v2 = nullptr);
 
     ~GraphicsEnvironment() override = default;
+
+    GraphicsEnvironment(const GraphicsEnvironment&) = default;
+    GraphicsEnvironment& operator=(const GraphicsEnvironment&) = default;
+    GraphicsEnvironment(GraphicsEnvironment&&) noexcept = default;
+    GraphicsEnvironment& operator=(GraphicsEnvironment&&) noexcept = default;
 
     u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override;
 
