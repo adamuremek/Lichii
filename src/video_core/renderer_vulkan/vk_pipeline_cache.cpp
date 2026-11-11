@@ -258,7 +258,9 @@ ShaderTranslationKey MakeShaderTranslationKey(const GraphicsPipelineCacheKey& pi
                                               std::span<Shader::Environment* const> envs,
                                               const Device& device) {
     const FixedPipelineState& state{pipeline_key.state};
-    const bool has_tessellation_eval{pipeline_key.unique_hashes[3] != 0};
+    const bool has_tessellation_eval{std::ranges::any_of(envs, [](const Shader::Environment* env) {
+        return env->ShaderStage() == Shader::Stage::TessellationEval;
+    })};
     const bool has_geometry{pipeline_key.unique_hashes[4] != 0};
     const bool has_fragment{pipeline_key.unique_hashes[5] != 0};
     const bool has_mesh{std::ranges::any_of(envs, [](const Shader::Environment* env) {
