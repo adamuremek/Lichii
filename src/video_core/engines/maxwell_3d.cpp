@@ -10,6 +10,7 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <limits>
 #include <optional>
 #include <span>
@@ -1257,6 +1258,9 @@ struct Maxwell3D::FrontState {
     u64 back_last{};                 ///< The position after the last macro sent to the back
     std::atomic<u32> back_escapes{}; ///< Back macros that wrote outside their write set
     u32 back_escapes_seen{};
+    /// EDEN_NX2_PASS_CUTS: the render target registers of the pass being sent.
+    std::vector<u32> pass_targets;
+    bool pass_verify_due{};
 };
 
 namespace {
@@ -1313,6 +1317,129 @@ void CheckDmaRead(u32 macro, GPUVAddr source, bool drained, bool waited,
     undrained_reads = 0;
     waits = 0;
     differences = 0;
+}
+
+// EDEN_NX2_PASS_CUTS=1 (or =verify): where the front would cut the stream into passes, a draw
+// after the render target registers changed, and how much of the register state it knows there.
+// A back that runs passes in parallel needs every register at each cut: those a macro the back
+// ran may have written (back_owned) the front does not know. Every 10 s a line with the cuts and
+// the registers unknown at them. With =verify, every 64th cut the front waits for the back and
+// compares its registers with the back's (FrontVerify logs the differences).
+int PassCutsMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_PASS_CUTS");
+        if (value == nullptr) {
+            return std::getenv("EDEN_NX2_PASS_SNAPSHOT") != nullptr ? 1 : 0;
+        }
+        return std::string_view{value} == "verify" ? 2 : 1;
+    }();
+    return mode;
+}
+
+// EDEN_NX2_PASS_SNAPSHOT=check (or =load): at each pass cut the front sends its whole register
+// copy down the split, and the back compares it with its own registers when it reaches the cut,
+// in stream order and without waiting. With =load the back then takes its registers from the
+// snapshot and marks all state dirty, so each pass starts from the snapshot alone, as a pass run
+// on another thread would. Every 10 s a `Pass snapshots` line.
+int PassSnapshotMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_PASS_SNAPSHOT");
+        return value == nullptr ? 0 : std::string_view{value} == "load" ? 2 : 1;
+    }();
+    return mode;
+}
+
+template <class FrontState>
+bool NotePassCut(FrontState& fs, bool back_macro) {
+    using Regs = Maxwell3D::Regs;
+    static constexpr std::array<std::pair<u32, u32>, 5> Ranges{{
+        {static_cast<u32>(MAXWELL3D_REG_INDEX(rt)), static_cast<u32>(sizeof(Regs::rt) / sizeof(u32))},
+        {static_cast<u32>(MAXWELL3D_REG_INDEX(zeta)), static_cast<u32>(sizeof(Regs::zeta) / sizeof(u32))},
+        {static_cast<u32>(MAXWELL3D_REG_INDEX(zeta_size)), static_cast<u32>(sizeof(Regs::zeta_size) / sizeof(u32))},
+        {static_cast<u32>(MAXWELL3D_REG_INDEX(zeta_enable)), static_cast<u32>(1)},
+        {static_cast<u32>(MAXWELL3D_REG_INDEX(rt_control)), static_cast<u32>(1)},
+    }};
+    struct Stats {
+        u64 cuts{};
+        u64 known{};
+        u64 targets_unknown{};
+        u64 back_macro_cuts{};
+        u64 owned{};
+        u64 most_owned{};
+        u64 verifies{};
+        std::array<u32, Regs::NUM_REGS> hits{};
+        std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+    };
+    static Stats stats;
+    bool changed = fs.pass_targets.empty();
+    bool targets_unknown = false;
+    size_t word = 0;
+    for (const auto& [start, count] : Ranges) {
+        if (fs.pass_targets.size() < word + count) {
+            fs.pass_targets.resize(word + count);
+        }
+        changed |= std::memcmp(&fs.pass_targets[word], &fs.regs[start], count * sizeof(u32)) != 0;
+        for (u32 i = 0; i < count; ++i) {
+            targets_unknown |= fs.back_owned[start + i];
+        }
+        word += count;
+    }
+    if (!changed && !targets_unknown) {
+        return false;
+    }
+    word = 0;
+    for (const auto& [start, count] : Ranges) {
+        std::memcpy(&fs.pass_targets[word], &fs.regs[start], count * sizeof(u32));
+        word += count;
+    }
+    ++stats.cuts;
+    stats.back_macro_cuts += back_macro ? 1 : 0;
+    stats.targets_unknown += targets_unknown ? 1 : 0;
+    const u64 owned = fs.back_owned.count();
+    stats.known += owned == 0 ? 1 : 0;
+    stats.owned += owned;
+    stats.most_owned = (std::max)(stats.most_owned, owned);
+    if (owned != 0) {
+        for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+            stats.hits[i] += fs.back_owned[i] ? 1 : 0;
+        }
+    }
+    if (PassCutsMode() == 2 && (stats.cuts & 63) == 0) {
+        fs.pass_verify_due = true;
+        ++stats.verifies;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - stats.last).count();
+    if (seconds < 10.0) {
+        return true;
+    }
+    std::array<std::pair<u32, u32>, 8> top{};
+    for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+        std::pair<u32, u32> entry{stats.hits[i], i};
+        for (auto& slot : top) {
+            if (entry.first > slot.first) {
+                std::swap(entry, slot);
+            }
+        }
+    }
+    std::string registers;
+    for (const auto& [hits, index] : top) {
+        if (hits != 0) {
+            registers += fmt::format(" {:#x}:{}", index, hits);
+        }
+    }
+    LOG_INFO(HW_GPU,
+             "Pass cuts per second: {:.0f} ({:.0f} at a macro sent to the back), {:.0f} with every "
+             "register known, {:.0f} with a render target register unknown | registers unknown at "
+             "a cut: {:.1f} on average, {} at most | most often unknown (register:cuts):{} | {} "
+             "verified",
+             stats.cuts / seconds, stats.back_macro_cuts / seconds, stats.known / seconds,
+             stats.targets_unknown / seconds,
+             stats.cuts != 0 ? static_cast<double>(stats.owned) / static_cast<double>(stats.cuts)
+                             : 0.0,
+             stats.most_owned, registers.empty() ? " none" : registers, stats.verifies);
+    stats = Stats{};
+    return true;
 }
 
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
@@ -1626,6 +1753,10 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
             } else if (!FrontHandledOutsideDrawManager(method)) {
                 fs.draw_pending = true;
+                if (PassCutsMode() != 0 && NotePassCut(fs, false) && PassSnapshotMode() != 0)
+                    [[unlikely]] {
+                    FrontSendPassSnapshot(split, fs, method);
+                }
             }
             break;
         }
@@ -1737,6 +1868,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             fs.regs[method] = last;
         }
         fs.draw_pending = true;
+        if (PassCutsMode() != 0 && NotePassCut(fs, false) && PassSnapshotMode() != 0)
+            [[unlikely]] {
+            FrontSendPassSnapshot(split, fs, method);
+        }
     } else {
         // CallMethod for each word, macro uploads among them (load_mme.instruction). A word may
         // change the shadow RAM mode for the next (a run of SET_SHADOW_RAM_CONTROL writes).
@@ -1783,6 +1918,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             default:
                 if (!FrontHandledOutsideDrawManager(method)) {
                     fs.draw_pending = true;
+                    if (PassCutsMode() != 0 && NotePassCut(fs, false) && PassSnapshotMode() != 0)
+                        [[unlikely]] {
+                        FrontSendPassSnapshot(split, fs, method);
+                    }
                 }
                 break;
             }
@@ -1855,6 +1994,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     VideoCommon::GpuSplit::Writes::Caches, VideoCommon::GpuSplit::FastDrawNeutral);
     }
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
+        FrontVerify(split, fs);
+    }
+    if (fs.pass_verify_due) [[unlikely]] {
+        fs.pass_verify_due = false;
         FrontVerify(split, fs);
     }
 }
@@ -1963,6 +2106,9 @@ bool Maxwell3D::FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& spli
         old_writes = FrontRunTheOldWay(split, fs, start);
         fs.back_record.clear();
         back.split_record = &fs.back_record;
+    }
+    if (PassCutsMode() != 0 && NotePassCut(fs, true) && PassSnapshotMode() != 0) [[unlikely]] {
+        FrontSendPassSnapshot(split, fs, ~0U); // it may draw
     }
     split.DeferWords(
         [this, system_ptr = &system, engine_ptr = &back, macro = known.get(),
@@ -2410,6 +2556,93 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
     if ((checks & 63) == 1) {
         LOG_INFO(HW_GPU, "Split front register checks: {} done, {} differences", checks, differences);
     }
+}
+
+void Maxwell3D::FrontSendPassSnapshot(VideoCommon::GpuSplit& split, const FrontState& fs,
+                                      u32 skip) {
+    // `skip`: the register of the write that found the cut. The front's copy holds it already;
+    // the back runs it after the snapshot.
+    auto snapshot = std::make_shared<std::vector<u32>>(fs.regs.begin(), fs.regs.end());
+    auto unknown = std::make_shared<std::vector<u32>>();
+    if (fs.back_owned.any()) {
+        for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+            if (fs.back_regs[i] != 0) {
+                unknown->push_back(i);
+            }
+        }
+    }
+    const bool load = PassSnapshotMode() == 2;
+    split.DeferFunction(
+        [this, snapshot, unknown, skip, load] {
+            BackPassSnapshot(*snapshot, *unknown, skip, load);
+        },
+        VideoCommon::GpuSplit::Writes::Noted);
+}
+
+void Maxwell3D::BackPassSnapshot(const std::vector<u32>& snapshot,
+                                 const std::vector<u32>& unknown, u32 skip, bool load) {
+    struct Stats {
+        u64 cuts{};
+        u64 differing_cuts{};
+        u64 differences{};
+        u64 loaded{};
+        std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+    };
+    static Stats stats;
+    static u64 total_differences{};
+    static u32 logged{};
+    // State writes the back still holds in its method sink count as done (as in FrontVerify).
+    std::array<u32, Regs::NUM_REGS> expected;
+    std::memcpy(expected.data(), regs.reg_array.data(), sizeof(expected));
+    for (const auto& [method, value] : method_sink) {
+        expected[method] = shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay
+                               ? shadow_state.reg_array[method]
+                               : value;
+    }
+    std::bitset<Regs::NUM_REGS> left;
+    for (const u32 index : unknown) {
+        left[index] = true;
+    }
+    if (skip < Regs::NUM_REGS) {
+        left[skip] = true;
+    }
+    ++stats.cuts;
+    u64 differences = 0;
+    for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+        if (left[i] || snapshot[i] == expected[i]) {
+            continue;
+        }
+        ++differences;
+        if (logged < 32) {
+            ++logged;
+            LOG_WARNING(HW_GPU, "Pass snapshot register {:#x}: front {:#x}, back {:#x}", i,
+                        snapshot[i], expected[i]);
+        }
+    }
+    stats.differing_cuts += differences != 0 ? 1 : 0;
+    stats.differences += differences;
+    total_differences += differences;
+    if (load) {
+        // The registers the sink still holds are written again when it is consumed.
+        for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
+            if (!left[i]) {
+                regs.reg_array[i] = snapshot[i];
+            }
+        }
+        dirty.flags.set();
+        ++stats.loaded;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - stats.last).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    LOG_INFO(HW_GPU,
+             "Pass snapshots per second: {:.0f} checked on the back, {:.0f} with a register that "
+             "differs ({:.0f} registers), {:.0f} loaded | {} differing registers since boot",
+             stats.cuts / seconds, stats.differing_cuts / seconds, stats.differences / seconds,
+             stats.loaded / seconds, total_differences);
+    stats = Stats{};
 }
 
 void Maxwell3D::FinishFrontMacro(Core::System& system) {

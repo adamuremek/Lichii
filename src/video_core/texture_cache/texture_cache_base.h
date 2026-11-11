@@ -33,6 +33,7 @@
 #include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
+#include "video_core/texture_cache/pass_stats.h"
 #include "video_core/texture_cache/pending_download.h"
 #include "common/thread_worker.h"
 #include "video_core/compatible_formats.h"
@@ -318,6 +319,8 @@ public:
         prepare_log = log;
         prepare_log_dry = dry;
     }
+
+    PassStats pass_stats; ///< EDEN_NX2_PASS_STATS
 
     /// Get the sampler from the graphics/compute descriptor table in the specified index
     Sampler* GetSampler(u32 index, bool compute);
@@ -669,6 +672,9 @@ private:
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
+    /// True while FindRenderTargetView looks up or makes its image (see JoinImages).
+    bool inserting_render_target = false;
+    u64 overwritten_targets_deleted{};
     bool is_rescaling = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
@@ -760,6 +766,7 @@ private:
     boost::container::small_vector<ImageId, 4> join_right_aliased_ids;
     ::Common::unordered_set<ImageId> join_ignore_textures;
     boost::container::small_vector<ImageId, 4> join_bad_overlap_ids;
+    boost::container::small_vector<ImageId, 4> join_overwritten_ids;
     struct JoinCopy {
         bool is_alias;
         ImageId id;

@@ -379,6 +379,7 @@ void TextureCache<P>::LogThresholds() const {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    pass_stats.EndFrame();
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -599,11 +600,13 @@ void TextureCache<P>::TickFrame() {
         LOG_INFO(HW_GPU,
                  "Memory trace: texture cache {} images {} MiB ({} MiB GPU-written, {} unbacked), "
                  "device usage {} MiB (expected {} MiB, critical {} MiB), sentenced {} MiB, {} "
-                 "async decodes {} MiB, scratch {} MiB",
+                 "async decodes {} MiB, scratch {} MiB, {} targets deleted as a new one overwrote "
+                 "them",
                  images, image_bytes >> 20, gpu_written_bytes >> 20, unbacked,
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20,
                  sentenced >> 20, async_decodes.size(), decode_bytes >> 20,
-                 (swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity()) >> 20);
+                 (swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity()) >> 20,
+                 overwritten_targets_deleted);
         if constexpr (requires { runtime.LogMemoryTrace(); }) {
             runtime.LogMemoryTrace();
         }
@@ -1179,6 +1182,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        pass_stats.Targets(render_targets_serial);
         return;
     }
 
@@ -1231,6 +1235,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     if (render_targets != previous_render_targets) {
         ++render_targets_serial;
     }
+    pass_stats.Targets(render_targets_serial);
 
     flags[Dirty::DepthBiasGlobal] = true;
 }
@@ -3333,8 +3338,45 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    // A new render target over most of an older one the GPU wrote, which is neither a part of it
+    // nor contains it: the guest gave that memory to the new target, so the older one is dead
+    // and goes now rather than when the collector reaches it. Ocarina of Time lays out each
+    // frame's targets (2560x1440 and 1280x720 colour and depth, tens of 384x384 shadow maps) after
+    // shadow maps whose size changes every frame, so each frame's ~50 targets start a few pages
+    // from the last frame's: they piled up to the critical memory (~200 MiB a frame), where the
+    // collector deleted and the recycler emptied every frame. Not one used this frame or bound now.
+    static const bool keep_overwritten = std::getenv("EDEN_NX2_KEEP_OVERWRITTEN_TARGETS") != nullptr;
+    join_overwritten_ids.clear();
+    const auto overwritten = [&](const ImageBase& old) {
+        if (!inserting_render_target || keep_overwritten ||
+            False(old.flags & ImageFlagBits::GpuModified) ||
+            True(old.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseTiles |
+                              ImageFlagBits::Remapped | ImageFlagBits::IsDecoding)) ||
+            True(new_image.flags & ImageFlagBits::Sparse) ||
+            lru_cache.Tick(old.lru_index) >= frame_tick) {
+            return false;
+        }
+        const VAddr begin = (std::max)(old.cpu_addr, new_image.cpu_addr);
+        const VAddr end = (std::min)(old.cpu_addr_end, new_image.cpu_addr_end);
+        const u64 smaller = (std::min)(old.guest_size_bytes, new_image.guest_size_bytes);
+        if (end <= begin || (end - begin) * 2 < smaller) {
+            return false;
+        }
+        for (const ImageViewId view_id : old.image_view_ids) {
+            if (render_targets.depth_buffer_id == view_id ||
+                std::ranges::find(render_targets.color_buffer_ids, view_id) !=
+                    render_targets.color_buffer_ids.end()) {
+                return false;
+            }
+        }
+        return true;
+    };
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
+        if (overwritten(aliased)) {
+            join_overwritten_ids.push_back(aliased_id);
+            continue;
+        }
         aliased.overlapping_images.push_back(new_image_id);
         new_image.overlapping_images.push_back(aliased_id);
         if (aliased.info.resources.levels == 1 && aliased.info.block.depth == 0 &&
@@ -3345,6 +3387,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             new_image.overlapping_images.size() > 1) {
             new_image.flags |= ImageFlagBits::BadOverlap;
         }
+    }
+    for (const ImageId overwritten_id : join_overwritten_ids) {
+        Image& old = slot_images[overwritten_id];
+        MarkStale(old); // before UntrackImage (see MarkStale)
+        if (True(old.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(old, overwritten_id);
+        }
+        UnregisterImage(overwritten_id);
+        DeleteImage(overwritten_id);
+        ++overwritten_targets_deleted;
     }
 
     // The copy from an alias into the new image, or null when the loop below skips it.
@@ -3671,11 +3723,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     }
     ImageId image_id{};
     bool delete_state = has_deleted_images;
+    inserting_render_target = true;
     do {
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
+    inserting_render_target = false;
     has_deleted_images = delete_state;
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
@@ -4344,6 +4398,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         if (prepare_log_dry) {
             return;
         }
+    }
+    if (is_modification) {
+        pass_stats.Write(image_id.index);
+    } else {
+        pass_stats.Read(image_id.index);
     }
     Image& image = slot_images[image_id];
     if (invalidate) {

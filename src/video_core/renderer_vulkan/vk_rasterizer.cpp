@@ -800,6 +800,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
 
     SCOPE_EXIT {
+        texture_cache.pass_stats.Draw();
+    };
+    SCOPE_EXIT {
         const VideoCommon::Nx2Profile::FineScope tick_scope{
             VideoCommon::Nx2Profile::Zone::TickWork};
         gpu.TickWork();
@@ -1868,6 +1871,7 @@ void RasterizerVulkan::DrawTexture() {
     std::scoped_lock l{texture_cache.mutex};
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
+    texture_cache.pass_stats.Draw();
 
     UpdateDynamicStates(nullptr);
 
@@ -1932,6 +1936,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
     std::scoped_lock lock{texture_cache.mutex};
     texture_cache.UpdateRenderTargets(true);
+    texture_cache.pass_stats.Draw();
     const Framebuffer* const framebuffer = texture_cache.GetFramebuffer();
     if (frame_dump.Capturing()) {
         FrameDumpPass(framebuffer);
@@ -2140,6 +2145,9 @@ void RasterizerVulkan::DispatchCompute() {
         const VideoCommon::Nx2Profile::FineScope tick_scope{
             VideoCommon::Nx2Profile::Zone::TickWork};
         gpu.TickWork();
+    };
+    SCOPE_EXIT {
+        texture_cache.pass_stats.Compute();
     };
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
     FlushWork();

@@ -3495,6 +3495,9 @@ private:
                       u32 count);
     void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
+    void FrontSendPassSnapshot(VideoCommon::GpuSplit& split, const FrontState& state, u32 skip);
+    void BackPassSnapshot(const std::vector<u32>& snapshot, const std::vector<u32>& unknown,
+                          u32 skip, bool load);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
