@@ -21,6 +21,7 @@ public:
     bool indirect_pointer{true};
     u32 cbuf_base{};
     bool throws{};
+    bool forgot_lacked_reads{};
 
     TestEnvironment() {
         stage = Shader::Stage::Fragment;
@@ -77,6 +78,9 @@ public:
         return std::nullopt;
     }
     void Dump(u64, u64) override {}
+    void ForgetLackedReads() override {
+        forgot_lacked_reads = true;
+    }
 };
 
 /// What a native program's translation asks: a constant, then a storage buffer pointer slot and
@@ -123,6 +127,7 @@ TEST_CASE("Shader reuse matches environments with the same answers", "[shader_re
     TestEnvironment throwing = same;
     throwing.throws = true;
     REQUIRE_FALSE(reads.Matches(throwing));
+    REQUIRE(throwing.forgot_lacked_reads);
 }
 
 TEST_CASE("Shader reuse cache finds shaders by key and environment", "[shader_reuse]") {
@@ -185,4 +190,18 @@ TEST_CASE("Shader reuse cache drops the least recently used keys past its bound"
     REQUIRE(cache.Find(make_key(2), envs) == nullptr);
     // Dropped shaders stay alive for whoever still holds them.
     REQUIRE(added[2]->reads.size() == 1);
+}
+
+TEST_CASE("Reusable shaders keep the SPIR-V of the stages that have it", "[shader_reuse]") {
+    std::array<std::vector<u32>, Vulkan::Maxwell::MaxShaderStage> spirv;
+    spirv[0] = {0x07230203, 1, 2, 3};
+    spirv[4] = std::vector<u32>(1000, 0x12345678);
+    Vulkan::ReusableShaders shaders;
+    shaders.SetSpirv(spirv);
+    REQUIRE(shaders.Spirv() == spirv);
+    REQUIRE(shaders.SpirvBytes() != 0);
+    const auto infos{shaders.InfoPointers()};
+    REQUIRE(infos[0] == &shaders.infos[0]);
+    REQUIRE(infos[1] == nullptr);
+    REQUIRE(infos[4] == &shaders.infos[4]);
 }

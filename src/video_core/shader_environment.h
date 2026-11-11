@@ -316,6 +316,10 @@ public:
                (!recorded_read_properties || *recorded_read_properties == read_properties);
     }
 
+    void ForgetLackedReads() override {
+        lacks_recorded_value = false;
+    }
+
 private:
     std::vector<u64> code;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;

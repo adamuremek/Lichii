@@ -121,7 +121,8 @@ public:
     void Finish();
 
     /// Whether `env` has the same properties and gives the same answer to every read. Its own
-    /// read log (what the disk cache stores) gets the same entries a translation would add.
+    /// read log (what the disk cache stores) gets the same entries a translation would add, and
+    /// a read it lacks is forgotten (Shader::Environment::ForgetLackedReads).
     [[nodiscard]] bool Matches(Shader::Environment& env) const;
 
     bool operator==(const TranslationReads&) const = default;

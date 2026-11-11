@@ -98,6 +98,7 @@ bool TranslationReads::Matches(Shader::Environment& env) const try {
     });
 } catch (const Shader::Exception&) {
     // A disk cache environment throws when asked what its own translation did not ask.
+    env.ForgetLackedReads();
     return false;
 }
 
