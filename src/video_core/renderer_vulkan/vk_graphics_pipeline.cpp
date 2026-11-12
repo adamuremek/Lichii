@@ -479,6 +479,11 @@ GraphicsPipeline::GraphicsPipeline(
         // the constant buffers bound and the data in memory then.
         const auto add = [&](const auto& desc) {
             if (desc.handle_program != ~0U) {
+                if (desc.count > 1) {
+                    // A table of handles the shader indexes is resolved only by full draws
+                    // (EvaluateTextureHandles); delta draws and retexturing take one handle.
+                    block(DeltaBlocker::ComputedHandles);
+                }
                 has_computed_handles = true;
                 return;
             }
