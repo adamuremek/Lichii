@@ -300,6 +300,8 @@ private:
     void LoadAmiibo(const QString& filename);
 
     bool SelectAndSetCurrentUser(const Core::Frontend::ProfileSelectParameters& parameters);
+    bool ConfirmLowRamBoot(const QString& filename,
+                           const Service::AM::FrontendAppletParameters& params);
 
     /**
      * Stores the filename in the recently loaded files list.
@@ -414,6 +416,7 @@ private slots:
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
     void OnInstallDecryptionKeys();
+    void OnWhatsNew();
     void OnAbout();
     void OnEdenDependencies();
     void OnApplyRecommendedSettings();
@@ -465,9 +468,11 @@ private slots:
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
 #endif
+    void KeepNextendoSessionAlive();
 
 private:
     void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
+    void OnGameListEditNxMetadata(const std::string& game_path);
     void RemovePlayTimeData(u64 program_id);
     bool SelectRomFSDumpTarget(const FileSys::ContentProvider&, u64 program_id,
                                u64* selected_title_id, u8* selected_content_record_type);
@@ -485,6 +490,7 @@ private:
     void UpdateStatusBar();
     void UpdateGPUAccuracyButton();
     void UpdateStatusButtons();
+    void UpdateMenuIcons();
     void UpdateUISettings();
     void UpdateInputDrivers();
     void HideMouseCursor();
@@ -533,6 +539,8 @@ private:
     LoadingScreen* loading_screen = nullptr;
     QTimer shutdown_timer;
     QTimer emu_terminate_timer;
+    QTimer nextendo_session_timer;
+    QFutureWatcher<bool> nextendo_session_watcher;
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
 #ifdef HAS_RESHADE
@@ -621,6 +629,7 @@ private:
     bool nup_running{};
     QPointer<ShaderWarmDialog> shader_warm_dialog;
     NxTools* nx_tools = nullptr;
+    bool nx_metadata_write_in_progress = false;
     std::string nup_source_path;
 
     // Last game booted, used for multi-process apps
