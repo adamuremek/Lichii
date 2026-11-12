@@ -71,11 +71,14 @@ TEST_CASE("ShaderPrecache: launch requests are taken once", "[video_core]") {
 TEST_CASE("ShaderPrecache: the marker matches only the same file and driver", "[video_core]") {
     TempDir dir;
     const auto warm = dir.path / "warm-compute.bin";
-    REQUIRE_FALSE(ShaderWarm::CurrentWarmStamp(warm, 0, 1, 2, 3).has_value());
+    const auto current = [&](u64 entries, u32 driver, u32 device_id, u32 version, u64 folder) {
+        return *ShaderWarm::CurrentWarmStamp(warm, entries, driver, device_id, version, folder);
+    };
+    REQUIRE_FALSE(ShaderWarm::CurrentWarmStamp(warm, 0, 1, 2, 3, 0x77).has_value());
     REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
 
     WriteBytes(warm, "precache");
-    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53);
+    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53, 0x77);
     REQUIRE(stamp.has_value());
     REQUIRE(stamp->size == 8);
     REQUIRE(ShaderWarm::WriteWarmMarker(warm, *stamp));
@@ -85,13 +88,43 @@ TEST_CASE("ShaderPrecache: the marker matches only the same file and driver", "[
     REQUIRE(marker.has_value());
     REQUIRE(marker->entries == 12);
     // The entry count is informative: a stamp taken before reading the file still matches.
-    REQUIRE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 0, 0x1234, 0x2206, 53)));
-    REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1235, 0x2206, 53)));
-    REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2207, 53)));
-    REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 54)));
+    REQUIRE(marker->Matches(current(0, 0x1234, 0x2206, 53, 0x77)));
+    REQUIRE_FALSE(marker->Matches(current(12, 0x1235, 0x2206, 53, 0x77)));
+    REQUIRE_FALSE(marker->Matches(current(12, 0x1234, 0x2207, 53, 0x77)));
+    REQUIRE_FALSE(marker->Matches(current(12, 0x1234, 0x2206, 54, 0x77)));
+
+    // Another install folder has its own driver shader cache.
+    REQUIRE(marker->executable == 0x77);
+    REQUIRE_FALSE(marker->Matches(current(12, 0x1234, 0x2206, 53, 0x78)));
 
     WriteBytes(warm, "a rebuilt precache");
-    REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
+    REQUIRE_FALSE(marker->Matches(current(12, 0x1234, 0x2206, 53, 0x77)));
+}
+
+TEST_CASE("ShaderPrecache: a marker without the install folder matches no folder", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache");
+    const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53, 0x77);
+    REQUIRE(stamp.has_value());
+    // The six fields markers had before the install folder was recorded.
+    WriteBytes(ShaderWarm::WarmMarkerPath(warm),
+               std::to_string(stamp->size) + ' ' + std::to_string(stamp->write_time) +
+                   " 12 4660 8710 53\n");
+    const auto marker = ShaderWarm::ReadWarmMarker(warm);
+    REQUIRE(marker.has_value());
+    REQUIRE(marker->executable == 0);
+    REQUIRE_FALSE(marker->Matches(*stamp));
+}
+
+TEST_CASE("ShaderPrecache: the install folder stamp is stable", "[video_core]") {
+    const u64 stamp = ShaderWarm::ExecutableStamp();
+    REQUIRE(stamp == ShaderWarm::ExecutableStamp());
+#ifdef _WIN32
+    REQUIRE(stamp != 0);
+#else
+    REQUIRE(stamp == 0);
+#endif
 }
 
 TEST_CASE("ShaderPrecache: precached pipelines are kept per driver", "[video_core]") {
@@ -106,6 +139,19 @@ TEST_CASE("ShaderPrecache: precached pipelines are kept per driver", "[video_cor
     REQUIRE(ShaderWarm::ReadPrecachedPipelines(file, {0x1235, 0x2206, 53}).empty());
     REQUIRE(ShaderWarm::ReadPrecachedPipelines(file, {0x1234, 0x2207, 53}).empty());
     REQUIRE(ShaderWarm::ReadPrecachedPipelines(file, {0x1234, 0x2206, 54}).empty());
+    REQUIRE(ShaderWarm::ReadPrecachedPipelines(file, {0x1234, 0x2206, 53, 0x78}).empty());
+
+    // A list from before the install folder was recorded ("PGP1") is built again.
+    const auto old_file = dir.path / "old-precache-graphics.bin";
+    {
+        std::ofstream out(old_file, std::ios::binary);
+        const u32 words[]{0x31504750, 0x1234, 0x2206, 53};
+        const u64 count{1}, hash{42};
+        out.write(reinterpret_cast<const char*>(words), sizeof(words));
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        out.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+    }
+    REQUIRE(ShaderWarm::ReadPrecachedPipelines(old_file, stamp).empty());
 
     // A truncated file keeps the hashes it holds in full.
     std::filesystem::resize_file(file, std::filesystem::file_size(file) - 4);

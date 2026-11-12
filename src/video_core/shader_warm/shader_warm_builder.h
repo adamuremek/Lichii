@@ -38,8 +38,17 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 /// file of another size.
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
+/// The emulator's install folder as precache stamps record it, 0 where the driver's own shader
+/// cache does not depend on it.
+///
+/// On Windows, AMD's and NVIDIA's drivers keep their shader caches per application path. A new
+/// install folder (a new package, a moved portable copy) starts with an empty one while the
+/// user's data folder still says the precache ran, so every pipeline it skipped was compiled in
+/// play instead (about 1 s per new compute pipeline on AMD).
+[[nodiscard]] u64 ExecutableStamp();
+
 /// What a marker records: the precache file's size and last-write time, its entry count, the GPU
-/// driver version and device ID and the pipeline cache version.
+/// driver version and device ID, the pipeline cache version and the install folder.
 struct WarmStamp {
     u64 size{};
     s64 write_time{};
@@ -47,18 +56,21 @@ struct WarmStamp {
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u64 executable{};
 
-    /// True when `other` was written for the same file, driver, device and cache version (the
-    /// entry count is informative).
+    /// True when `other` was written for the same file, driver, device, cache version and
+    /// install folder (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
         return size == other.size && write_time == other.write_time && driver == other.driver &&
-               device_id == other.device_id && cache_version == other.cache_version;
+               device_id == other.device_id && cache_version == other.cache_version &&
+               executable == other.executable;
     }
 };
 
 /// The stamp of `warm_file` as it is now, empty when its size or time cannot be read.
 std::optional<WarmStamp> CurrentWarmStamp(const std::filesystem::path& warm_file, u64 entries,
-                                          u32 driver, u32 device_id, u32 cache_version);
+                                          u32 driver, u32 device_id, u32 cache_version,
+                                          u64 executable);
 
 /// The marker of `warm_file`, empty when there is none or it cannot be read.
 std::optional<WarmStamp> ReadWarmMarker(const std::filesystem::path& warm_file);
@@ -89,11 +101,13 @@ bool TakeWarmBeforeStart();
 void RequestSkipWarm();
 bool TakeSkipWarm();
 
-/// The GPU driver, device and pipeline cache version pipelines were precached for.
+/// The GPU driver, device, pipeline cache version and install folder (ExecutableStamp)
+/// pipelines were precached for.
 struct DriverStamp {
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u64 executable{};
 
     bool operator==(const DriverStamp&) const = default;
 };
@@ -103,7 +117,7 @@ struct DriverStamp {
 std::filesystem::path PrecachedPipelinesPath(u64 title_id);
 
 /// The pipeline key hashes in `file`, empty when there is none or it was written for another
-/// driver, device or cache version.
+/// driver, device, cache version or install folder.
 std::unordered_set<u64> ReadPrecachedPipelines(const std::filesystem::path& file,
                                                const DriverStamp& stamp);
 

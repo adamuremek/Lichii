@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,7 +46,7 @@ constexpr std::string_view StageConverting = "Converting";
 constexpr std::string_view StageWriting = "Writing";
 /// Conversions in flight (each holds a copy of its program).
 constexpr size_t MaxPendingJobs = 2048;
-constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
+constexpr u32 PrecachedPipelinesMagic = 0x32504750; // "PGP2", with the install folder
 
 fs::path TitleDir(u64 title_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
@@ -320,8 +322,25 @@ u64 ReadWarmCount(const fs::path& warm_file) {
     return !ec && actual == size ? entries : 0;
 }
 
+u64 ExecutableStamp() {
+#ifdef _WIN32
+    static const u64 stamp = [] {
+        // Windows paths ignore case
+        std::string folder = Common::FS::PathToUTF8String(Common::FS::GetExeDirectory());
+        std::ranges::transform(folder, folder.begin(), [](unsigned char c) {
+            return static_cast<char>(c < 0x80 ? std::tolower(c) : c);
+        });
+        const u64 hash = Common::CityHash64(folder.data(), folder.size());
+        return hash != 0 ? hash : 1;
+    }();
+    return stamp;
+#else
+    return 0;
+#endif
+}
+
 std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries, u32 driver,
-                                          u32 device_id, u32 cache_version) {
+                                          u32 device_id, u32 cache_version, u64 executable) {
     std::error_code ec;
     const auto size = fs::file_size(warm_file, ec);
     if (ec) {
@@ -333,7 +352,8 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
     }
     return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
                      entries,   driver,
-                     device_id, cache_version};
+                     device_id, cache_version,
+                     executable};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
@@ -343,13 +363,18 @@ std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
           stamp.device_id >> stamp.cache_version)) {
         return std::nullopt;
     }
+    // Markers written before the install folder was recorded have none, and match no folder.
+    if (!(in >> stamp.executable)) {
+        stamp.executable = 0;
+    }
     return stamp;
 }
 
 bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
     out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+        << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' ' << stamp.executable
+        << '\n';
     out.close();
     return static_cast<bool>(out);
 }
@@ -392,6 +417,7 @@ std::unordered_set<u64> ReadPrecachedPipelines(const fs::path& file, const Drive
         !in.read(reinterpret_cast<char*>(&saved.driver), sizeof(saved.driver)) ||
         !in.read(reinterpret_cast<char*>(&saved.device_id), sizeof(saved.device_id)) ||
         !in.read(reinterpret_cast<char*>(&saved.cache_version), sizeof(saved.cache_version)) ||
+        !in.read(reinterpret_cast<char*>(&saved.executable), sizeof(saved.executable)) ||
         !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || saved != stamp) {
         return hashes;
     }
@@ -412,6 +438,7 @@ bool WritePrecachedPipelines(const fs::path& file, const DriverStamp& stamp,
     Write(out, stamp.driver);
     Write(out, stamp.device_id);
     Write(out, stamp.cache_version);
+    Write(out, stamp.executable);
     Write(out, static_cast<u64>(hashes.size()));
     for (const u64 hash : hashes) {
         Write(out, hash);

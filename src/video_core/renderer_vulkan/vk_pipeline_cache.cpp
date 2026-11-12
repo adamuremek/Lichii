@@ -1147,7 +1147,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (precache) {
         precached_pipelines = ShaderWarm::ReadPrecachedPipelines(
             ShaderWarm::PrecachedPipelinesPath(title_id),
-            {device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION});
+            {device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION,
+             ShaderWarm::ExecutableStamp()});
     }
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -1737,7 +1738,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     const std::string path = Common::FS::PathToUTF8String(warm_file);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION);
+                                            device.GetDeviceID(), CACHE_VERSION,
+                                            ShaderWarm::ExecutableStamp());
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;
@@ -1748,7 +1750,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     if (!std::filesystem::exists(warm_file, ec)) {
         LOG_INFO(Render_Vulkan, "Shader precache: no precache file at {}", path);
     } else if (current && marker && marker->Matches(*current)) {
-        LOG_INFO(Render_Vulkan, "Shader precache: compute programs already done for this driver");
+        LOG_INFO(Render_Vulkan,
+                 "Shader precache: compute programs already done for this driver and install");
     } else {
         // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
         try {
@@ -1898,7 +1901,9 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     if (precached.size() != precached_before) {
         ShaderWarm::WritePrecachedPipelines(
             ShaderWarm::PrecachedPipelinesPath(title_id),
-            {device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION}, precached);
+            {device.GetDriverVersion(), device.GetDeviceID(), CACHE_VERSION,
+             ShaderWarm::ExecutableStamp()},
+            precached);
     }
     if (!stop_loading.stop_requested() && total_built != 0) {
         // Without this, the builds reach the file only at the next boot, game change or clean
