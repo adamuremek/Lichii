@@ -172,7 +172,8 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
-                                   std::array<f32, 2> motion_scale, bool use_history = true) override;
+                                   std::array<f32, 2> motion_scale, bool use_history,
+                                   std::optional<std::array<u32, 2>> render_region) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -258,6 +259,8 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
@@ -393,14 +396,26 @@ private:
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
 
+    /// The registers resolving views and samplers reads besides the handles: the texture header
+    /// and sampler pools and how samplers are bound (TextureCache::SynchronizeDescriptors).
+    using TextureRegisters = std::array<u32, 7>;
+    [[nodiscard]] static TextureRegisters ReadTextureRegisters(const Maxwell& regs) noexcept {
+        return {regs.tex_header.address_high,  regs.tex_header.address_low,
+                regs.tex_header.limit,         regs.tex_sampler.address_high,
+                regs.tex_sampler.address_low,  regs.tex_sampler.limit,
+                static_cast<u32>(regs.sampler_binding)};
+    }
     /// Fast draw (nx2_fast_draw.h): what the last recorded draw left bound.
     struct ReusableDraw {
         GraphicsPipeline* pipeline{};
         const Tegra::Engines::Maxwell3D* maxwell3d{};
         u64 serial{};
+        u64 memory_serial{};
         u64 map_serial{};
         u64 tick{};
         u64 render_pass{};
+        u64 generation{}; ///< pipeline->DeltaGeneration() after the draw
+        TextureRegisters texture_registers{};
         Maxwell::PrimitiveTopology topology{};
         bool is_indexed{};
     };
@@ -415,7 +430,8 @@ private:
         HandleData,
         SampledImages,
         ComputedHandles,
-        VertexInput,
+        /// The pipeline looked up after pipeline-only changes resolves images differently.
+        OtherPipeline,
         Count,
     };
     /// Why a recorded draw can't be followed by a delta draw.
@@ -441,6 +457,9 @@ private:
         /// PrepareDraw time and draws per path.
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_ns{};
         std::array<u64, static_cast<size_t>(DrawPath::Count)> prepare_draws{};
+        /// TEST: full draws' PrepareDraw time and count by why they were full.
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full_ns{};
+        std::array<u64, static_cast<size_t>(FullDraw::Count)> full_timed{};
         /// EDEN_NX2_FAST_DRAW_VERIFY
         u64 verified{};
         u64 pipeline_mismatches{};
@@ -451,25 +470,79 @@ private:
         /// StateChanged draws by the reason of the last break, and by its 3D method.
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, Maxwell::NUM_REGS> break_methods{};
+        /// Draws that looked their pipeline up (taken_relookup) by what made them, and how they
+        /// went: the same pipeline, another that took the kept state, or another that resolves
+        /// differently (resolved in full).
+        std::array<u64, 3> relookup_causes{};
+        u64 relookup_same{};
+        u64 relookup_moved{};
+        u64 relookup_other{};
+        /// Draws that read their texture handles again: kept the views, resolved some, or
+        /// couldn't (resolved in full); and the ones a computed handle change made read them.
+        u64 retexture_unchanged{};
+        u64 retexture_resolved{};
+        u64 retexture_failed{};
+        u64 retexture_computed{};
+        /// Draws that came back to their pipeline's own last draw (RevisitDraw), and the ones
+        /// that couldn't by why (RevisitMiss).
+        u64 revisits{};
+        std::array<u64, 8> revisit_misses{};
         u64 window_start{};
     };
+    /// Why RevisitDraw couldn't keep what the pipeline resolved at its last recorded draw.
+    enum RevisitMiss : size_t {
+        RevisitNoDraw,     ///< none remembered (another pipeline's in its slot)
+        RevisitPipeline,   ///< takes no delta draws, or samples texture or image buffers or images
+        RevisitMemory,     ///< memory or mappings changed since
+        RevisitSubmitted,  ///< another command buffer or render pass
+        RevisitTextures,   ///< other texture pool registers, or transform feedback
+        RevisitKind,       ///< indirect, inline index or frame dump draws
+        RevisitGeneration, ///< the pipeline kept other state since (or gave it to another)
+    };
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
-    /// the remembered draw either way: only a recorded draw remembers one again.
+    /// the remembered draw either way: only a recorded draw remembers one again. With
+    /// taken_relookup set, the pipeline is only where the kept state is: the draw looks its own
+    /// up, and takes the delta path with it when it resolves alike (SharesDeltaStateWith).
     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
-    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
-    /// map_serial as read then), and the images it samples need no preparing.
-    bool DeltaStillHolds(u64 serial, u64 map_serial);
+    /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serials
+    /// and map_serial as read then) for `pipeline`, which holds the kept state, and the images
+    /// it samples need no preparing. computed_checked: the computed handles were evaluated
+    /// since the caches were locked and hold.
+    bool DeltaStillHolds(GraphicsPipeline* pipeline, u64 serial, u64 memory_serial,
+                         u64 map_serial, bool computed_checked);
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
-                          u64 map_serial);
+                          u64 memory_serial, u64 map_serial);
+    /// For a draw TakeReusableDraw found no delta draw for (no candidate, another pipeline, state
+    /// changes): whether `pipeline` can take the delta path with what it kept at its own last
+    /// recorded draw (revisit_draws), nothing those views were resolved from having changed since
+    /// but its texture handles, which the draw reads again (taken_retexture). Sets taken_draw.
+    bool RevisitDraw(GraphicsPipeline* pipeline, bool is_indirect);
     void ReportFastDraws();
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
+    bool taken_relookup{};
+    /// The draw reads its texture handles again (GraphicsPipeline::RetextureDelta).
+    bool taken_retexture{};
+    /// The draw keeps what its pipeline resolved at its own last draw (RevisitDraw).
+    bool taken_revisit{};
+    /// Each pipeline's last recorded draw (direct-mapped by the pipeline's address).
+    std::array<ReusableDraw, 256> revisit_draws{};
+    [[nodiscard]] static size_t RevisitSlot(const GraphicsPipeline* pipeline) noexcept {
+        return static_cast<size_t>((reinterpret_cast<uintptr_t>(pipeline) >> 4) *
+                                   0x9E3779B97F4A7C15ULL >> 56);
+    }
+    FullDraw last_full_reason{}; ///< TEST: why the draw resolves in full (FastDrawStats::full_ns)
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
     std::array<std::array<VideoCommon::Nx2FastDraw::DeviceSpans, Maxwell::MaxConstBuffers>,
                Maxwell::MaxShaderStage>
         handle_spans;
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
+    /// Nx2FastDraw::MemorySerial and the GPU memory map when the previous draw locked the caches:
+    /// a full draw keeps uniforms as a delta draw when neither changed since.
+    u64 uniform_memory_serial{~u64{0}};
+    u64 uniform_map_serial{~u64{0}};
+    const Tegra::MemoryManager* uniform_gpu_memory{};
     FastDrawStats fast_draw_stats;
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};

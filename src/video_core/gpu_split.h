@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "common/common_types.h"
+#include "common/container/unordered_map.h"
 
 namespace Core {
 class System;
@@ -386,6 +387,63 @@ public:
         u64 device_address) const;
     /// Whether compute or copy work sent so far is still queued (EDEN_NX2_DRAIN_CHECK).
     [[nodiscard]] bool WritersPending() const;
+    /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<device address>): whether releases to the semaphore word
+    /// at `device_address` are logged.
+    [[nodiscard]] static u64 SemaphoreWatch() {
+        return WatchRanges()[0].first;
+    }
+    /// TEST: where the entry the back runs starts in the ring.
+    [[nodiscard]] static u64 EntryStart() {
+        return Get().back_entry_start;
+    }
+    [[nodiscard]] static bool WatchesSemaphore(u64 device_address) {
+        if (SemaphoreWatch() == 0) [[likely]] {
+            return false;
+        }
+        for (const auto& [start, size] : WatchRanges()) {
+            if (start != 0 && device_address >= start && device_address < start + size) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /// TEST: the first watched word [device_address, +size) covers, or 0.
+    [[nodiscard]] static u64 WatchCovers(u64 device_address, u64 size) {
+        if (SemaphoreWatch() == 0) [[likely]] {
+            return 0;
+        }
+        for (const auto& [start, length] : WatchRanges()) {
+            if (start != 0 && device_address < start + length && start < device_address + size) {
+                return std::max(start, device_address);
+            }
+        }
+        return 0;
+    }
+    /// TEST (EDEN_NX2_SEM_WATCH_DEVICE=<hex device address>[:<size>],...): up to four ranges.
+    [[nodiscard]] static const std::array<std::pair<u64, u64>, 4>& WatchRanges() {
+        static const std::array<std::pair<u64, u64>, 4> ranges = [] {
+            std::array<std::pair<u64, u64>, 4> parsed{};
+            const char* text = std::getenv("EDEN_NX2_SEM_WATCH_DEVICE");
+            for (size_t i = 0; text != nullptr && *text != '\0' && i < parsed.size(); ++i) {
+                char* end{};
+                parsed[i].first = std::strtoull(text, &end, 16) & ~u64{3};
+                parsed[i].second = 4;
+                if (*end == ':') {
+                    parsed[i].second = std::max<u64>(4, std::strtoull(end + 1, &end, 0));
+                }
+                text = *end == ',' ? end + 1 : nullptr;
+            }
+            return parsed;
+        }();
+        return ranges;
+    }
+    /// TEST: the calling thread's part in the split, for watch logs.
+    [[nodiscard]] static const char* ThreadRole() {
+        return on_back_thread ? "back" : "other";
+    }
+    /// Front thread, diagnostics: the ring's positions on both sides, with what was last sent to
+    /// the semaphore word at `device_address`.
+    [[nodiscard]] std::string DescribeState(u64 device_address) const;
     /// TEST (EDEN_NX2_ACQUIRE_STATS): the engine and method of the method entry that ends at
     /// `end`, among the last LoggedMethods sent, as "KeplerCompute 0x6d"; empty if none.
     [[nodiscard]] std::string MethodEndingAt(u64 end) const;
@@ -469,6 +527,11 @@ public:
     /// that may land anywhere.
     [[nodiscard]] u64 PlacedWritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
                                          u64 size) const;
+    /// PlacedWritesTarget by the exact ranges of the placed writes the back may not have run: the
+    /// latest position of those that write [address, address + size), 0 if none. Empty when some
+    /// of them were dropped from the log (PlacedLogSize writes sent since).
+    [[nodiscard]] std::optional<u64> ExactPlacedTarget(const Tegra::MemoryManager& memory,
+                                                       GPUVAddr address, u64 size) const;
     /// The position after the compute and copy work sent before the last NoteSync.
     [[nodiscard]] u64 SyncedWriterPosition() const {
         return (std::min)(synced_writer_position, write_position);
@@ -658,8 +721,10 @@ private:
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Front side, in its own 128-byte block (x86 prefetchers pull 64-byte lines in pairs): the
+    // back writes back_engine on every engine switch, and next to these fields that made the
+    // front miss the cache on almost every ring write (found by SerkiGohan).
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};
@@ -674,7 +739,7 @@ private:
         bool fenced;
     };
     /// The front's NoteSemaphoreWrite, by word address.
-    std::unordered_map<u64, SemaphoreWrite> semaphore_writes;
+    Common::unordered_map<u64, SemaphoreWrite> semaphore_writes;
     size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
     /// After the last entry that may write guest memory or the GPU caches anywhere (NoteAnyWrite,
     /// NoteUnplacedWrite, NoteCacheWrite), the last one that may write guest memory itself
@@ -689,6 +754,30 @@ private:
     u64 last_noted_write{};
     alignas(64) std::array<WriteSet, size_t{1} << WriteSlotBits> write_sets{};
     alignas(64) std::array<WriteSet, size_t{1} << CoarseSlotBits> coarse_sets{};
+    /// The placed writes in the order noted (NoteDeviceWriteAt, NoteCoarseDeviceWriteAt), with
+    /// their exact ranges: what the sets can't tell apart (writes next to a word in its granule,
+    /// other granules hashed to its set) for those the back has not run (ExactPlacedTarget).
+    struct PlacedLogEntry {
+        u64 position; ///< As placed (late QMD releases: before `sent`)
+        u64 sent;     ///< The write position when noted, in log order
+        DAddr begin;
+        DAddr end;
+    };
+    static constexpr size_t PlacedLogSize = size_t{1} << 16;
+    std::unique_ptr<PlacedLogEntry[]> placed_log;
+    u64 placed_log_count{};
+    u64 placed_log_lost{}; ///< The latest `sent` of the entries written over
+    void LogPlacedWrite(DAddr address, u64 size, u64 position) {
+        if (!placed_log) [[unlikely]] {
+            return; // Not started: nothing asks
+        }
+        PlacedLogEntry& entry = placed_log[placed_log_count & (PlacedLogSize - 1)];
+        if (placed_log_count >= PlacedLogSize) {
+            placed_log_lost = (std::max)(placed_log_lost, entry.sent);
+        }
+        entry = {position, write_position, address, address + size};
+        ++placed_log_count;
+    }
     u64 published_local{};
     /// PublishHold: Commit publishes nothing.
     bool publish_held{};
@@ -701,8 +790,8 @@ private:
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Back side, in its own block.
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
     u64 back_entry_start{}; ///< Where the entry the back runs starts (BackEntry)
 
     /// An entry's position as fenced writes name it: with this start of the split in the high

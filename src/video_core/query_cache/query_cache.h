@@ -174,6 +174,9 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
     std::mutex flush_guard;
     std::deque<u64> flushes_pending;
     std::vector<QueryCacheBase<Traits>::QueryLocation> pending_unregister;
+    /// UnregisterPending's ids to free, by streamer, kept with their capacity.
+    std::array<std::vector<size_t>, static_cast<size_t>(QueryType::MaxQueryTypes)>
+        unregister_scratch;
 };
 
 template <typename Traits>
@@ -270,6 +273,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    if (VideoCommon::GpuSplit::WatchesSemaphore(cpu_addr)) [[unlikely]] {
+        LOG_INFO(HW_GPU,
+                 "Semaphore watch: report {:#x} to {:#x} (gpu {:#x}, as {}, type {}, flags {:#x}) on {}",
+                 payload, cpu_addr, addr, gpu_memory->GetID(), static_cast<u32>(counter_type),
+                 static_cast<u32>(flags), VideoCommon::GpuSplit::ThreadRole());
+    }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -407,6 +416,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             cpu_addr, static_cast<u32>(query_base->value),
             counter_type == QueryType::Payload ? Tegra::Nx2SemaphoreWaiters::Source::PayloadRelease
                                                : Tegra::Nx2SemaphoreWaiters::Source::QueryResult);
+        if (VideoCommon::GpuSplit::WatchesSemaphore(cpu_addr)) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Semaphore watch: {:#x} written to {:#x} at its fence (mirrored {}) on {}",
+                     static_cast<u32>(query_base->value), cpu_addr, mirrored,
+                     VideoCommon::GpuSplit::ThreadRole());
+        }
         if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
             const bool wide = True(query_base->flags & QueryFlagBits::HasTimestamp);
             LOG_INFO(HW_GPU,
@@ -452,6 +466,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             }
             Tegra::Nx2SemaphoreWaiters::Get().OnWrite(
                 cpu_addr, payload, Tegra::Nx2SemaphoreWaiters::Source::PayloadRelease);
+            if (VideoCommon::GpuSplit::WatchesSemaphore(cpu_addr)) [[unlikely]] {
+                LOG_INFO(HW_GPU, "Semaphore watch: {:#x} written to {:#x} at once (mirrored {}, diverted {}) on {}",
+                         payload, cpu_addr, mirrored, mirrored && shadow.Diverts(cpu_addr),
+                         VideoCommon::GpuSplit::ThreadRole());
+            }
             if (const u64 trace = QueryTrace::Sample(QueryTrace::Event::Write)) {
                 LOG_INFO(HW_GPU,
                          "DKB_QUERY write n={} path=immediate as={} gpu={:#x} device={:#x} type={} "
@@ -488,27 +507,41 @@ void QueryCacheBase<Traits>::UnregisterPending() {
         return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
                                         static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
     };
-    std::scoped_lock lock(cache_mutex);
-    for (QueryLocation loc : impl->pending_unregister) {
-        const auto [streamer_id, query_id] = loc.unpack();
-        auto* streamer = impl->streamers[streamer_id];
-        if (!streamer) [[unlikely]] {
-            continue;
-        }
-        auto* query = streamer->GetQuery(query_id);
-        auto [cont_addr, base] = gen_caching_indexing(query->guest_address);
-        auto it1 = cached_queries.find(cont_addr);
-        if (it1 != cached_queries.end()) {
-            auto it2 = it1->second.find(base);
-            if (it2 != it1->second.end()) {
-                if (it2->second.raw == loc.raw) {
-                    it1->second.erase(it2);
+    // The fencing thread runs this for every fence's reports while the GPU thread registers and
+    // builds new ones: the queries leave the cache under its lock, then each streamer frees its
+    // batch under its own lock once, instead of a streamer lock per query inside the cache's.
+    auto& freed = impl->unregister_scratch;
+    for (auto& ids : freed) {
+        ids.clear();
+    }
+    {
+        std::scoped_lock lock(cache_mutex);
+        for (QueryLocation loc : impl->pending_unregister) {
+            const auto [streamer_id, query_id] = loc.unpack();
+            auto* streamer = impl->streamers[streamer_id];
+            if (!streamer) [[unlikely]] {
+                continue;
+            }
+            auto* query = streamer->GetQuery(query_id);
+            auto [cont_addr, base] = gen_caching_indexing(query->guest_address);
+            auto it1 = cached_queries.find(cont_addr);
+            if (it1 != cached_queries.end()) {
+                auto it2 = it1->second.find(base);
+                if (it2 != it1->second.end()) {
+                    if (it2->second.raw == loc.raw) {
+                        it1->second.erase(it2);
+                    }
                 }
             }
+            freed[streamer_id].push_back(query_id);
         }
-        streamer->Free(query_id);
     }
     impl->pending_unregister.clear();
+    for (size_t streamer_id = 0; streamer_id < freed.size(); ++streamer_id) {
+        if (!freed[streamer_id].empty()) {
+            impl->streamers[streamer_id]->FreeMany(freed[streamer_id]);
+        }
+    }
 }
 
 template <typename Traits>

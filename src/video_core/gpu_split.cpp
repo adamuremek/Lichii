@@ -144,6 +144,9 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     profile_publishes = Nx2Profile::Enabled();                      // TEST
     log_methods = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr; // TEST
     ring = std::make_unique<u64[]>(RingWords);
+    if (!placed_log) {
+        placed_log = std::make_unique<PlacedLogEntry[]>(PlacedLogSize);
+    }
     ++starts; // Before the back starts: it tags the entries of fenced writes with it (EntryTag)
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
     active = true;
@@ -183,6 +186,8 @@ void GpuSplit::Stop() {
     last_noted_write = 0;
     write_sets.fill({});
     coarse_sets.fill({});
+    placed_log_count = 0;
+    placed_log_lost = 0;
     published_local = 0;
     publish_held = false;
     logged_method_count = 0;
@@ -314,10 +319,22 @@ GpuSplit::Landing GpuSplit::FencedPayloadLanding() {
 
 void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known, bool at_least,
                                   Landing landing) {
+    // TEST (EDEN_NX2_SEM_WATCH_DEVICE): every release sent to the watched word.
+    if (WatchesSemaphore(device_address)) [[unlikely]] {
+        LOG_INFO(HW_GPU,
+                 "Semaphore watch: release {:#x} to {:#x} sent at {} by {} (known {}, at least {}, "
+                 "{}); ran {}",
+                 payload, device_address, write_position,
+                 front_engine != nullptr && front_engine->bound_type
+                     ? EngineName(front_engine->bound_type)
+                     : std::string_view{"the puller"},
+                 known, at_least, landing == Landing::Fenced ? "fenced" : "at run",
+                 consumed.load(std::memory_order_acquire));
+    }
     if (semaphore_writes.size() >= semaphore_writes_limit) {
         // The words of releases in memory hold their values.
-        std::erase_if(semaphore_writes,
-                      [this](const auto& entry) { return InMemory(entry.second); });
+        boost::unordered::erase_if(semaphore_writes,
+                                   [this](const auto& entry) { return InMemory(entry.second); });
         semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
     }
     // The release is in the last entry sent, or one before (a QMD signal valued late).
@@ -350,6 +367,25 @@ std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
 bool GpuSplit::WritersPending() const {
     return consumed.load(std::memory_order_acquire) <
            std::min(last_writer_position, write_position);
+}
+
+std::string GpuSplit::DescribeState(u64 device_address) const {
+    std::string text = fmt::format(
+        "split: sent {}, published {}, ran {}, back idle at {:#x}, back waiting {}, last writer {}, "
+        "last sync {}",
+        write_position, published_local, consumed.load(std::memory_order_acquire),
+        back_idle_at.load(std::memory_order_relaxed), back_waiting.load(std::memory_order_relaxed),
+        last_writer_position, last_sync_position);
+    if (const auto it = semaphore_writes.find(device_address & ~u64{3});
+        it != semaphore_writes.end()) {
+        const SemaphoreWrite& write = it->second;
+        text += fmt::format("; last write sent: {:#x} at {} (entry {:#x}), known {}, at least {}, "
+                            "fenced {}, landed up to {:#x}, in memory {}",
+                            write.payload, write.position, write.entry, write.known,
+                            write.at_least, write.fenced,
+                            fenced_landed.load(std::memory_order_acquire), InMemory(write));
+    }
+    return text;
 }
 
 namespace {
@@ -432,6 +468,7 @@ void GpuSplit::NoteDeviceWriteAt(DAddr address, u64 size, u64 position) {
         NoteSetWrite(write_sets[WriteSlot(granule)], granule, position);
     }
     last_noted_write = std::max(last_noted_write, position);
+    LogPlacedWrite(address, size, position);
 }
 
 void GpuSplit::NoteCoarseDeviceWriteAt(DAddr address, u64 size, u64 position) {
@@ -440,6 +477,31 @@ void GpuSplit::NoteCoarseDeviceWriteAt(DAddr address, u64 size, u64 position) {
         NoteSetWrite(coarse_sets[CoarseSlot(granule)], granule, position);
     }
     last_noted_write = std::max(last_noted_write, position);
+    LogPlacedWrite(address, size, position);
+}
+
+std::optional<u64> GpuSplit::ExactPlacedTarget(const Tegra::MemoryManager& memory,
+                                               GPUVAddr address, u64 size) const {
+    const u64 ran = consumed.load(std::memory_order_acquire);
+    if (!placed_log || placed_log_lost > ran) {
+        return std::nullopt;
+    }
+    const u64 first = placed_log_count - (std::min<u64>)(placed_log_count, PlacedLogSize);
+    u64 target = 0;
+    ForEachDeviceRange(memory, address, size, [&](DAddr device, u64 bytes) {
+        const DAddr end = device + bytes;
+        for (u64 index = placed_log_count; index > first; --index) {
+            const PlacedLogEntry& entry = placed_log[(index - 1) & (PlacedLogSize - 1)];
+            // Every entry noted before this one was noted by then: the back ran them all.
+            if (entry.sent <= ran) {
+                return;
+            }
+            if (entry.begin < end && device < entry.end && entry.position > ran) {
+                target = (std::max)(target, entry.position);
+            }
+        }
+    });
+    return target;
 }
 
 u64 GpuSplit::WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size) const {

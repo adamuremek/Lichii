@@ -46,6 +46,13 @@
 
 namespace Tegra::Engines {
 
+namespace {
+// TEST (EDEN_NX2_SEM_WATCH_DEVICE): the QMDs that released into the watched word, and the QMD the
+// scheduler ran last (the back's schedulers run on one thread).
+std::unordered_set<u64> g_watched_qmds;
+u64 g_last_run_qmd{};
+} // namespace
+
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     : memory_manager{memory_manager_}
     , upload_state{memory_manager, regs.upload}
@@ -55,6 +62,16 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
         native_qmd.trace = [this](std::string_view event, u64 address, s32 value) {
             LOG_INFO(HW_GPU, "QMD trace {} {:#x} {} (engine {} as {})", event, address, value,
                      fmt::ptr(this), memory_manager.GetID());
+        };
+    } else if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) {
+        native_qmd.trace = [this](std::string_view event, u64 address, s32 value) {
+            if (event == "run") {
+                g_last_run_qmd = address;
+            }
+            LOG_INFO(HW_GPU, "Semaphore watch: QMD {:#x} {} {} (engine {}){} on {}", address,
+                     event, value, fmt::ptr(this),
+                     g_watched_qmds.contains(address) ? " watched" : "",
+                     VideoCommon::GpuSplit::ThreadRole());
         };
     }
     native_qmd.skipped_release = [](u64 address, std::size_t slot, std::span<const u32, 4> words) {
@@ -124,8 +141,17 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
         rasterizer->SignalFence([this, address, payload, reduction] {
-            memory_manager.Write<u32>(address, ReduceSemaphore(reduction, false,
-                                                               memory_manager.Read<u32>(address), payload));
+            const u32 guest = memory_manager.Read<u32>(address);
+            const u32 value = ReduceSemaphore(reduction, false, guest, payload);
+            memory_manager.Write<u32>(address, value);
+            if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+                // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+                if (VideoCommon::GpuSplit::WatchesSemaphore(
+                        memory_manager.GpuToCpuAddress(address).value_or(0))) {
+                    LOG_INFO(HW_GPU, "Semaphore watch: compute reduction {:#x} -> {:#x} on {}",
+                             guest, value, VideoCommon::GpuSplit::ThreadRole());
+                }
+            }
         });
         return;
     }
@@ -388,6 +414,18 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
+                if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+                    // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+                    if (const auto device = memory_manager.GpuToCpuAddress(address);
+                        device && VideoCommon::GpuSplit::WatchCovers(*device, 4)) {
+                        g_watched_qmds.insert(g_last_run_qmd);
+                        LOG_INFO(HW_GPU,
+                                 "Semaphore watch: QMD {:#x} releases {:#x} flags {:#x} (signal "
+                                 "{:#x} {:#x}) on {}",
+                                 g_last_run_qmd, payload, flags, qmd_address, argument,
+                                 VideoCommon::GpuSplit::ThreadRole());
+                    }
+                }
                 // TEST (EDEN_NX2_DRAIN_CHECK): what the front's QMD view compares its notes with.
                 const auto checked = [this, address](u32 offset, u32 value) {
                     if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
@@ -465,6 +503,12 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         if (VideoCommon::Nx2DrainCheck::g_enabled) [[unlikely]] {
             // TEST: where this signal's reads end, for the front's QMD view check.
             VideoCommon::Nx2DrainCheck::NoteQmdSignalEnd(VideoCommon::GpuSplit::OnBackThread());
+        }
+        if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+            // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+            LOG_INFO(HW_GPU, "Semaphore watch: QMD signal {:#x} {:#x} (engine {}, as {}) '{}' at {} on {}",
+                     qmd_address, argument, fmt::ptr(this), memory_manager.GetID(), error,
+                     VideoCommon::GpuSplit::EntryStart(), VideoCommon::GpuSplit::ThreadRole());
         }
         if (error.empty()) {
             LOG_DEBUG(HW_GPU, "Native QMD control action={:#x}, QMD={:#x}", argument, qmd_address);
@@ -860,6 +904,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     }
     if (native_key == passes->prepass) {
         dlss_chain.spatial_only = passes->spatial_only;
+        dlss_chain.render_region = passes->render_region;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
@@ -1305,17 +1350,23 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return GetTICEntry(tic_index);
     };
     const auto color = image(0x278), motion = image(0x290);
+    // A game that renders a region of its targets (The Duskbloods) draws it on the same pixel grid
+    // in targets of other sizes: in handheld mode its motion and depth are 1536x864 against a
+    // 1920x1080 colour. The upscale checks the region fits them.
+    const auto same_grid = [&](const Texture::TICEntry& other) {
+        return dlss_chain.render_region ||
+               (other.Width() == color->Width() && other.Height() == color->Height());
+    };
     if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
-        motion->Width() != color->Width() || motion->Height() != color->Height() ||
-        !motion->IsBlockLinear())
+        !same_grid(*motion) || !motion->IsBlockLinear())
         return;
     dlss_motion_vectors = *motion;
     dlss_motion_color = color->Address();
-    const auto depth = cbuf.size.Value() >= 0x29c ? image(0x298) : std::nullopt;
+    const u32 depth_offset = dlss_chain.render_region ? 0x288 : 0x298;
+    const auto depth = cbuf.size.Value() >= 0x29c ? image(depth_offset) : std::nullopt;
     if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
-        depth->Width() == color->Width() && depth->Height() == color->Height() &&
-        depth->IsBlockLinear()) {
+        same_grid(*depth) && depth->IsBlockLinear()) {
         dlss_depth = *depth;
     } else {
         dlss_depth.reset();
@@ -1401,6 +1452,70 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
     }
 }
 
+// Scales the region the game rendered up to the output, in place of the network's output pass.
+bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
+                                          const std::optional<Texture::TICEntry>& input,
+                                          const std::optional<Texture::TICEntry>& output,
+                                          const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
+                                          const std::optional<Texture::TICEntry>& motion,
+                                          const std::optional<Texture::TICEntry>& depth) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    if (!input || !output || !PlainImage(*input) || !PlainImage(*output) ||
+        input->format != Texture::TextureFormat::B10G11R11 ||
+        output->format != Texture::TextureFormat::B10G11R11 ||
+        input->Address() == output->Address() ||
+        launch_description.const_buffer_config[0].size.Value() < RenderLastColumnOffset + 4 ||
+        !memory_manager.IsFullyMappedRange(constants, RenderLastColumnOffset + 4)) {
+        return false;
+    }
+    const u32 width = memory_manager.Read<u32>(constants + RenderLastColumnOffset) + 1;
+    const u32 height = memory_manager.Read<u32>(constants + RenderLastRowOffset) + 1;
+    if (width == 0 || height == 0 || width > input->Width() || height > input->Height()) {
+        return false;
+    }
+    const auto surface = [](const Texture::TICEntry& tic) {
+        Fermi2D::Surface result{};
+        result.format = Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+        result.linear = Fermi2D::MemoryLayout::BlockLinear;
+        result.block_width.Assign(tic.block_width);
+        result.block_height.Assign(tic.block_height);
+        result.block_depth.Assign(tic.block_depth);
+        result.depth = 1;
+        result.width = tic.Width();
+        result.height = tic.Height();
+        result.addr_upper = static_cast<u32>(tic.Address() >> 32);
+        result.addr_lower = static_cast<u32>(tic.Address());
+        return result;
+    };
+    // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
+    // region is still scaled, without history, rather than leaving the network's output.
+    const bool use_history = jitter && motion && width <= motion->Width() &&
+                             height <= motion->Height() &&
+                             (!depth || (width <= depth->Width() && height <= depth->Height()));
+    Fermi2D::Surface motion_surface{};
+    if (use_history) {
+        motion_surface = surface(*motion);
+        motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
+    }
+    // The game's motion vectors point from the previous position to the current one (a rightward
+    // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
+    const std::array<f32, 2> motion_scale =
+        use_history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
+    const bool done = rasterizer->AccelerateTemporalUpscale(
+        surface(*input), surface(*output), motion_surface,
+        use_history && depth ? &*depth : nullptr,
+        jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, use_history,
+        std::array{width, height});
+    static u32 last_width{};
+    if (width != last_width) {
+        last_width = width;
+        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
+                 done ? "scaled" : "could not scale", width, height, input->Width(),
+                 input->Height(), output->Width(), output->Height());
+    }
+    return done;
+}
+
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
     static const bool requested_history = [] {
@@ -1413,7 +1528,7 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
-    if (!jitter || (use_history && (!motion || !depth))) {
+    if (!dlss_chain.render_region && (!jitter || (use_history && (!motion || !depth)))) {
         static std::array<bool, 2> reported{};
         if (!reported[game_index]) {
             reported[game_index] = true;
@@ -1438,6 +1553,9 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
+    if (dlss_chain.render_region) {
+        return ScaleDlssRenderRegion(address, input, output, jitter, motion, depth);
+    }
     if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
         jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
         jitter->width != input->Width() || jitter->height != input->Height()) {
@@ -1599,6 +1717,7 @@ struct ListCallContext {
     std::array<u32, 0x1000>& front_registers;
     std::array<u32, 0x1000>& engine_registers; ///< Set directly once the split stopped
     const EmitFunc& emit;
+    bool* upload_unknown; ///< FrontState::upload_unknown
 
     [[nodiscard]] std::optional<u64> DeviceWord(u64 gpu_address) const {
         if (!split.Ran(split.LastMappingChange())) {
@@ -1614,8 +1733,11 @@ struct ListCallContext {
     void Emit(u32 method, u32 value) const {
         emit(method, value);
     }
+    /// The upload data word emitted next is a placeholder, not what the back writes.
+    void TaintUpload() const {
+        *upload_unknown = true;
+    }
     void SendOwed(u64 device, u32 value) const {
-        GetFrontQmd().TaintUploads(split);
         split.Defer([rasterizer_ = rasterizer, device,
                      value] { rasterizer_->Nx2NoteOwedListWord(device, value); },
                     VideoCommon::GpuSplit::Writes::Noted);
@@ -1660,19 +1782,14 @@ struct KeplerCompute::FrontState {
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
     /// The inline upload the back runs, where a word of it lands (Nx2ListIndirect).
     Nx2ListIndirect::UploadState upload;
-    /// A linear one-line inline upload into a single QMD, for the QMD view
-    /// (FrontQmdView::NoteUploadedQmd): its bytes as the data words arrive.
-    struct QmdUpload {
-        bool tracked{};
-        GPUVAddr address{};
-        u32 size{};
-        u32 received{};
-        u64 prior{};      ///< The last write sent to the QMD before the upload
-        u64 started{};    ///< The position after exec_upload
-        u64 last_noted{}; ///< The last write sent to the QMD once a data method was noted
-        std::array<u8, 256> bytes{};
-    };
-    mutable QmdUpload qmd_upload;
+    /// The words of the last inline upload sent, for the QMD view (FrontQmdView::NoteUpload):
+    /// its serial (from its exec_upload), whether the front can't tell what it writes (more
+    /// words than kept, list word placeholders), and whether its last data method sent writes
+    /// it (Upload::State writes at a last call).
+    std::vector<u32> upload_words;
+    u64 upload_serial{};
+    bool upload_unknown{};
+    bool upload_written{};
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1714,7 +1831,8 @@ void KeplerCompute::ReleaseFront() {
                                                    this,
                                                    front->registers,
                                                    native_registers,
-                                                   no_emit};
+                                                   no_emit,
+                                                   &front->upload_unknown};
         auto& channel = Nx2ListIndirect::GetChannel(native_data_ram);
         if (!channel.words.empty() || !list_front->Registers().empty()) {
             Nx2ListIndirect::Stats::NoteConcretized(Nx2ListIndirect::Reason::Stop); // TEST
@@ -1740,11 +1858,17 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
     }
     Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument,
                                       [&fs](u32 reg) { return fs.registers[reg]; });
-    if (auto& upload = fs.qmd_upload;
-        method == Nx2ListIndirect::UploadData && upload.tracked && upload.received < upload.size) {
-        const u32 count = (std::min)(4U, upload.size - upload.received);
-        std::memcpy(upload.bytes.data() + upload.received, &argument, count);
-        upload.received += count;
+    if (method == Nx2ListIndirect::UploadExec) {
+        static u64 upload_serial{}; // Unique across the compute engines (front thread only)
+        fs.upload_words.clear();
+        fs.upload_serial = ++upload_serial;
+        fs.upload_unknown = false;
+    } else if (method == Nx2ListIndirect::UploadData) {
+        if (fs.upload_words.size() < VideoCommon::FrontQmdView::MaxUploadWords) {
+            fs.upload_words.push_back(argument);
+        } else {
+            fs.upload_unknown = true;
+        }
     }
     fs.registers[method] = argument;
     switch (method) {
@@ -1813,6 +1937,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     if (IsQmdMethod(method)) {
         GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
     }
+    fs.upload_written = is_last_call;
     {
         const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
         split.Method(this, method, argument, is_last_call, segment, FrontWrites(method));
@@ -1865,28 +1990,6 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontSta
     case 0x107:
         FrontInlineQmd(split, fs, argument);
         break;
-    case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
-        // An upload of one line into a single QMD: the front keeps its bytes for the QMD view.
-        Upload::Registers upload;
-        std::memcpy(&upload, fs.registers.data() + KEPLER_COMPUTE_REG_INDEX(upload),
-                    sizeof(upload));
-        auto& tracked = fs.qmd_upload;
-        const GPUVAddr address = upload.dest.Address();
-        const GPUVAddr qmd = address & ~GPUVAddr{0xff};
-        const u32 size = upload.line_length_in;
-        tracked.tracked = (argument & 1) != 0 && upload.line_count == 1 && size != 0 &&
-                          address - qmd + size <= tracked.bytes.size() &&
-                          memory_manager.IsFullyMappedRange(qmd, tracked.bytes.size());
-        if (tracked.tracked) {
-            tracked.address = address;
-            tracked.size = size;
-            tracked.received = 0;
-            tracked.prior = split.MemoryWritesTarget(memory_manager, qmd, tracked.bytes.size());
-            tracked.started = split.Position();
-            tracked.last_noted = tracked.prior;
-        }
-        break;
-    }
     case KEPLER_COMPUTE_REG_INDEX(data_upload): {
         // Upload::State::ProcessData, of the upload exec_upload started: the whole of it at each
         // data method, at most.
@@ -1895,37 +1998,27 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, const FrontSta
                     sizeof(upload));
         const bool linear = (fs.registers[KEPLER_COMPUTE_REG_INDEX(exec_upload)] & 1) != 0;
         const auto range = Upload::UploadedRange(upload, linear);
-        auto& tracked = fs.qmd_upload;
-        const GPUVAddr qmd = tracked.address & ~GPUVAddr{0xff};
-        // Only the upload's own words may have written the QMD since exec_upload.
-        if (tracked.tracked &&
-            (range.address != tracked.address || range.size != tracked.size ||
-             split.MemoryWritesTarget(memory_manager, qmd, tracked.bytes.size()) !=
-                 tracked.last_noted)) {
-            tracked.tracked = false;
+        // Before its write is placed: the QMD view reads a QMD it writes from its words.
+        if (range.size != 0) {
+            const bool known = linear && upload.line_count == 1 && !fs.upload_unknown &&
+                               fs.upload_written &&
+                               u64{upload.line_length_in} * upload.line_count == fs.upload.size;
+            GetFrontQmd().NoteUpload(split, FrontQmdMemory{memory_manager}, fs.upload_serial,
+                                     range.address, range.size, fs.upload_words, known);
         }
         split.NoteWrite(memory_manager, range.address, range.size);
-        if (!tracked.tracked) {
-            break;
-        }
-        tracked.last_noted = split.MemoryWritesTarget(memory_manager, qmd, tracked.bytes.size());
-        if (tracked.received < tracked.size) {
-            break;
-        }
-        tracked.tracked = false;
-        const auto device = memory_manager.GpuToCpuAddress(qmd);
-        if (device && tracked.last_noted == split.Position() &&
-            !GetFrontQmd().UploadsTaintedSince(tracked.started)) {
-            GetFrontQmd().NoteUploadedQmd(split, FrontQmdMemory{memory_manager}, qmd, *device,
-                                          static_cast<u32>(tracked.address - qmd),
-                                          tracked.bytes.data(), tracked.size, tracked.prior);
-        }
         break;
     }
     case 0xae:
     case 0xaf:
     case 0xb0:
         if (SignalsQmd(method, argument)) {
+            if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+                // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+                LOG_INFO(HW_GPU, "Semaphore watch: front QMD signal {:#x} {:#x} (engine {}) at {}",
+                         GPUVAddr{fs.registers[0xad]} << 8, argument, fmt::ptr(this),
+                         split.Position());
+            }
             GetFrontQmd().Signal(split, FrontQmdMemory{memory_manager},
                                  GPUVAddr{fs.registers[0xad]} << 8, argument, nullptr);
         }
@@ -2010,6 +2103,10 @@ void KeplerCompute::FrontInlineQmd(VideoCommon::GpuSplit& split, const FrontStat
         GetFrontQmd().NoteInlineWrite(split, *device, qmd);
     }
     if ((fs.registers[0xa7] & (1U << 24)) != 0 || (fs.registers[0xcc] & (1U << 12)) == 0) {
+        if (VideoCommon::GpuSplit::SemaphoreWatch() != 0) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Semaphore watch: front inline QMD signal {:#x} 0x3 (engine {}) at {}",
+                     address, fmt::ptr(this), split.Position());
+        }
         GetFrontQmd().Signal(split, FrontQmdMemory{memory_manager}, address, 3, &qmd);
     }
 }
@@ -2036,6 +2133,8 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     if (IsQmdMethod(method)) {
         GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
     }
+    // The back calls the last word a last call when it ends the method (CallMultiMethod).
+    fs.upload_written = methods_pending <= amount;
     {
         const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(method)};
         split.MultiMethod(this, method, base_start, amount, methods_pending, segment,
@@ -2081,7 +2180,8 @@ bool KeplerCompute::FrontTakeListWords(VideoCommon::GpuSplit& split, u32 method,
                                                this,
                                                fs.registers,
                                                native_registers,
-                                               no_emit};
+                                               no_emit,
+                                               &fs.upload_unknown};
     return list_front->PrepareCall(context, Nx2ListIndirect::GetChannel(native_data_ram), slot,
                                    count);
 }
@@ -2107,6 +2207,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         if (IsQmdMethod(address)) {
             GetFrontQmd().MaybeTakeOver(split, native_qmd, QmdTakeOver::QmdMethod);
         }
+        fs.upload_written = true; // A macro's writes are last calls
         {
             const VideoCommon::GpuSplit::PublishHold hold{split, ValuedFromMemory(address)};
             split.MacroWrite(this, address, value, FrontWrites(address));
@@ -2131,7 +2232,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                                                 this,
                                                 fs.registers,
                                                 native_registers,
-                                                emit};
+                                                emit,
+                                                &fs.upload_unknown};
         bool concretized{};
         Nx2ListIndirect::Reason reason{};
         if (list_front->Run(context, Nx2ListIndirect::GetChannel(native_data_ram), concretized,

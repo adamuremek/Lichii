@@ -34,7 +34,10 @@ class MemoryManager;
 /// GpuSplit::FastDrawNeutral), GPU::TickWork requests, texture cache writes, unmaps and
 /// deletions, shader removals, fence releases, HLE macros and frames. The rasterizer takes the
 /// delta path only while the serial, the GPU memory map, the command buffer, the render pass and
-/// the bound pipeline are the ones the previous draw left.
+/// the bound pipeline are the ones the previous draw left. A draw of another pipeline (or after a
+/// draw that can't be followed) takes it with what that pipeline kept at its own last draw while
+/// the memory serial, the map, the command buffer, the render pass and the texture pool registers
+/// are the ones that draw left, reading every texture handle again (the rasterizer's RevisitDraw).
 /// EDEN_NX2_FAST_DRAW_VERIFY=1 resolves those draws in full and counts where the pipeline, views,
 /// samplers or kept buffer bindings differ.
 namespace VideoCommon::Nx2FastDraw {
@@ -90,19 +93,49 @@ inline void SetEnabledForTest(bool on) {
     return verify;
 }
 
-inline std::atomic<u64> g_serial{1};
-/// The last break's reason and, for Register and Method, its 3D method (diagnostics).
+/// On their own cache lines, away from what every thread reads (g_enabled).
+alignas(64) inline std::atomic<u64> g_serial{1};
+/// Bumped by every break but a 3D register change: register writes change no memory, so draws
+/// with only those in between can keep uniforms as delta draws do (MemorySerial).
+inline std::atomic<u64> g_memory_serial{1};
+/// The reason of the break that bumped g_serial last and, for Register and Method, its 3D method
+/// (diagnostics; on the thread that draws, the first break since it read the serial).
 inline std::atomic<u32> g_last_break{};
+
+/// The thread that draws reads the serials before each draw (Serial, MemorySerial). Once one of
+/// its breaks bumped a serial since it last read it, more change nothing it compares: they skip
+/// the atomic add (~1.4 million other engine methods a second in Ocarina of Time's water). Other
+/// threads always bump.
+inline thread_local bool t_reads_serials{};
+inline thread_local bool t_serial_bumped{};
+inline thread_local bool t_memory_serial_bumped{};
 
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
-        g_serial.fetch_add(1, std::memory_order_relaxed);
-        g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+        if (reason != Reason::Register && !(t_reads_serials && t_memory_serial_bumped)) {
+            g_memory_serial.fetch_add(1, std::memory_order_relaxed);
+            t_memory_serial_bumped = t_reads_serials;
+        }
+        if (!(t_reads_serials && t_serial_bumped)) {
+            g_serial.fetch_add(1, std::memory_order_relaxed);
+            g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
+            t_serial_bumped = t_reads_serials;
+        }
     }
 }
 
+/// The thread that draws: what it compares fast draws with (and, from then on, its next break
+/// bumps the serial again).
 inline u64 Serial() {
+    t_reads_serials = true;
+    t_serial_bumped = false;
     return g_serial.load(std::memory_order_relaxed);
+}
+
+inline u64 MemorySerial() {
+    t_reads_serials = true;
+    t_memory_serial_bumped = false;
+    return g_memory_serial.load(std::memory_order_relaxed);
 }
 
 /// The device memory a GPU range maps to. A write through another GPU address that maps the
@@ -210,6 +243,24 @@ struct Delta {
 
 inline Delta g_delta;
 
+/// Moves g_delta into `out` and clears it, copying only the ranges in use (Delta is ~0.5 KiB and
+/// taken for every draw).
+inline void TakeDelta(Delta& out) {
+    Delta& delta = g_delta;
+    out.binds = delta.binds;
+    out.num_writes = delta.num_writes;
+    std::copy_n(delta.write_begin.begin(), delta.num_writes, out.write_begin.begin());
+    std::copy_n(delta.write_end.begin(), delta.num_writes, out.write_end.begin());
+    out.num_device_writes = delta.num_device_writes;
+    std::copy_n(delta.device_begin.begin(), delta.num_device_writes, out.device_begin.begin());
+    std::copy_n(delta.device_end.begin(), delta.num_device_writes, out.device_end.begin());
+    out.no_uniform_keeps = delta.no_uniform_keeps;
+    delta.binds = {};
+    delta.num_writes = 0;
+    delta.num_device_writes = 0;
+    delta.no_uniform_keeps = false;
+}
+
 /// Adds [begin, end) to a delta's range list: extends a range it touches or overlaps, else
 /// appends it. A full list widens the range that grows least instead (true then), which only
 /// makes Reaches more conservative.
@@ -270,5 +321,19 @@ inline void NoteDeviceData(DAddr begin, DAddr end) {
                                               delta.num_device_writes, begin, end);
     }
 }
+
+/// Inline constant buffer writes left out of the delta because they wrote the words memory
+/// held (EDEN_NX2_GPU_PROFILE logs them).
+inline std::atomic<u64> g_unchanged_writes{};
+
+/// Notes data about to be written to [begin, begin + bytes) in GPU memory: inline constant buffer
+/// `words`, unless memory holds those words already, or with `words` null data not known yet
+/// (reports). Texture and sampler headers are checked by the caller.
+void NoteWrittenData(Tegra::MemoryManager& memory, GPUVAddr begin, const void* words, u64 bytes);
+/// NoteWrittenData for inline constant buffer `words` the caller is about to write: true when
+/// the write changes nothing and can be left out (memory holds the words, and neither the GPU
+/// caches nor a download for a guest read may hold others there). Fast draws off: false.
+[[nodiscard]] bool WriteData(Tegra::MemoryManager& memory, GPUVAddr begin, const void* words,
+                             u64 bytes);
 
 } // namespace VideoCommon::Nx2FastDraw

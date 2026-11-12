@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -224,7 +225,8 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 }
 
 template <class P>
-void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data,
+                                 bool engine_write) {
     Nx2NoteListHostWrite(device_addr, size);
     NoteUniformWrite(device_addr, size);
     // TEST (EDEN_NX2_READ_CHECK): a newer value where an early download landed, as ClearDownload
@@ -243,7 +245,14 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
         if (!gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
             if (!Nx2Perf::Verify()) {
-                memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+                if (engine_write) {
+                    // Untracking the pages and tracking them again at the upload changed their
+                    // host protection twice (two VirtualProtect calls each, ~4% of the GPU
+                    // thread at Ocarina of Time's water) for writes no guest CPU access saw.
+                    memory_tracker.MarkRegionAsWrittenTracked(device_addr, size);
+                } else {
+                    memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+                }
                 MarkVertexBuffersStale(device_addr, size);
                 return;
             }
@@ -2502,6 +2511,20 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     if (!early_landed.empty()) [[unlikely]] {
         ForgetEarlyLanded(device_addr, size);
     }
+    if (const u64 watch = VideoCommon::GpuSplit::WatchCovers(device_addr, size); watch != 0) [[unlikely]] {
+        // TEST (EDEN_NX2_SEM_WATCH_DEVICE)
+        u32 value{};
+        u32 old{};
+        if (watch + 4 <= device_addr + size) {
+            std::memcpy(&value, data + (watch - device_addr), 4);
+        }
+        device_memory.ReadBlockUnsafe(watch, &old, sizeof(old));
+        LOG_INFO(HW_GPU,
+                 "Semaphore watch: buffer download {:#x} over {:#x} at {:#x} ({:#x} bytes at "
+                 "{:#x}) on {}, CPU written {}",
+                 value, old, watch, size, device_addr, VideoCommon::GpuSplit::ThreadRole(),
+                 cpu_written.Intersects(watch, 4));
+    }
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
         return;
@@ -2875,15 +2898,18 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     if constexpr (!IS_OPENGL && VideoCommon::StreamUniformReusable<Runtime>) {
         if (UniformRangeKept(stage, index, device_addr, size)) {
             if (ubo_keep_verify) {
-                ++uniform_keep.verified;
-                verify_kept = true;
-                if (!VideoCommon::KeptUniformHolds<Runtime>(device_memory, stage, index,
-                                                             device_addr, size)) {
-                    if (uniform_keep.mismatches++ < 16) {
-                        LOG_ERROR(HW_GPU,
-                                  "Uniform keep verify: stage {} slot {} at {:#x}+{:#x} changed "
-                                  "since the previous draw",
-                                  stage, index, device_addr, size);
+                // Only the ranges RebindKeptUniform would bind again: the others are streamed.
+                if (VideoCommon::KeptUniformMatches(runtime, stage, index, device_addr, size)) {
+                    ++uniform_keep.verified;
+                    verify_kept = true;
+                    if (!VideoCommon::KeptUniformHolds<Runtime>(device_memory, stage, index,
+                                                                 device_addr, size)) {
+                        if (uniform_keep.mismatches++ < 16) {
+                            LOG_ERROR(HW_GPU,
+                                      "Uniform keep verify: stage {} slot {} at {:#x}+{:#x} "
+                                      "changed since the previous draw",
+                                      stage, index, device_addr, size);
+                        }
                     }
                 }
             } else if (VideoCommon::RebindKeptUniform(runtime, stage, index, device_addr, size)) {
@@ -4724,7 +4750,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         return NULL_BINDING;
     }
 
-    const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
+    const bool reads_size_word =
+        !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     const u32 alignment = runtime.GetStorageBufferAlignment();
     struct CachedBinding {
@@ -4758,30 +4785,36 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         u32 size = [&]() {
             const u32 memory_layout_size = static_cast<u32>((std::min)(
                 u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+            const u32 packed_size = static_cast<u32>(next_qword);
+            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
+                                            packed_size != 0 && packed_size <= memory_layout_size;
+            const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
+            const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
             // culled every blade), and its light probe records reach about 130 MiB past theirs: a
             // 64 MiB cap left the far probes outside the binding, and the fog took one overbright
-            // constant from them. A native (Switch 2) compute pointer has no size either, and
-            // Mario Kart World's lighting passes read past 8 MiB from theirs: capped there, the
-            // reads came back zero and lit land and characters too dark. Written bindings keep
-            // a cap: a write marks the whole binding GPU-modified.
-            const bool native_compute = native_pointer && compute;
-            if ((table_pointer || native_compute) && !is_written) {
-                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
-                const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
+            // constant from them. Written pools keep a cap: a write marks the whole binding
+            // GPU-modified.
+            if (table_pointer && !is_written) {
                 return (std::min)(memory_layout_size, limit);
             }
             // A native compute program's pointer is bare: the word after it is another parameter
             // (a dimension, stride or texture handle), not an NVN buffer size. Taking it as one
             // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
+                // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
+                // came back zero and lit land and characters too dark. A read-only compute binding
+                // takes a larger size word. Binding to the end of the mapping instead spanned
+                // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.
+                if (compute && !is_written && next_qword_is_size && packed_size > bare) {
+                    return (std::min)(packed_size, limit);
+                }
+                return bare;
             }
-            const u32 packed_size = static_cast<u32>(next_qword);
-            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
-                                            packed_size != 0 && packed_size <= memory_layout_size;
             if (next_qword_is_size) {
                 return packed_size;
             }
@@ -4794,10 +4827,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
             if (native_pointer && compute) {
                 static std::atomic<u64> computed{}, past_cap{}, at_gap{}, logged{};
+                static std::atomic<u32> largest{};
                 static std::atomic<s64> next_log{};
                 const u64 total = computed.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (size > 8_MiB) {
                     past_cap.fetch_add(1, std::memory_order_relaxed);
+                    u32 seen = largest.load(std::memory_order_relaxed);
+                    while (size > seen &&
+                           !largest.compare_exchange_weak(seen, size, std::memory_order_relaxed)) {
+                    }
                 }
                 if (size < wanted) {
                     at_gap.fetch_add(1, std::memory_order_relaxed);
@@ -4813,9 +4851,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                     next_log.compare_exchange_strong(due, now + 10)) {
                     logged.store(long_bindings + gap_bindings, std::memory_order_relaxed);
                     LOG_INFO(HW_GPU,
-                             "Native compute storage bindings: {} reach past the old 8 MiB cap, "
-                             "{} stop at a mapping gap, of {} bound",
-                             long_bindings, gap_bindings, total);
+                             "Native compute storage bindings: {} reach past 8 MiB through their "
+                             "size word (largest {:#x} bytes), {} stop at a mapping gap, of {} "
+                             "bound",
+                             long_bindings, largest.load(std::memory_order_relaxed), gap_bindings,
+                             total);
                 }
             }
         }
