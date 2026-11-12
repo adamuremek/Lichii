@@ -332,6 +332,7 @@ void SetTransformFeedback(Shader::RuntimeInfo& info, const ShaderTranslationKey&
         info.xfb_varyings = varyings;
         info.xfb_count = count;
     }
+}
 
 // Switch 2 geometry shaders may write all 32 generic outputs next to Position and Layer: 133
 // components where Vulkan devices allow 128 (maxGeometryOutputComponents). AMD's Windows driver
