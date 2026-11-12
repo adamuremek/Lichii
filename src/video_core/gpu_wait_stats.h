@@ -135,6 +135,10 @@ inline void AddHostWait(u64 ns) {
 /// reactive flush, like t_host_waits).
 inline thread_local u64 t_download_bytes{};
 
+/// The reads of GPU-written memory this thread made (EDEN_NX2_GUEST_THREAD_STATS tells
+/// read-backs apart by it).
+inline thread_local u64 t_reads{};
+
 inline void AddDownloadBytes(u64 bytes) {
     t_download_bytes += bytes;
 }

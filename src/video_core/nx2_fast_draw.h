@@ -110,7 +110,27 @@ inline thread_local bool t_reads_serials{};
 inline thread_local bool t_serial_bumped{};
 inline thread_local bool t_memory_serial_bumped{};
 
+/// Bumped where the guest CPU may have synchronised with the GPU: fences, semaphores, syncpoints,
+/// reports, frames, other engines and requests from other threads. After one the guest may have
+/// written memory the caches were not told about (pages that aren't write-protected), so uniform
+/// keeps read their buffers again.
+inline std::atomic<u64> g_sync_serial{1};
+
+inline void NoteSync() {
+    g_sync_serial.fetch_add(1, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline u64 SyncSerial() {
+    return g_sync_serial.load(std::memory_order_acquire);
+}
+
 inline void Break(Reason reason, u32 method = 0) {
+    // 3D methods that let the CPU synchronise (reports, syncpoints) note it where they reach the
+    // rasterizer. Invalidations end image and shader lifetimes, not guest memory writes.
+    if (reason != Reason::Register && reason != Reason::Method && reason != Reason::ConstantData &&
+        reason != Reason::TextureHeaders && reason != Reason::Invalidation) {
+        NoteSync();
+    }
     if (Enabled()) {
         if (reason != Reason::Register && !(t_reads_serials && t_memory_serial_bumped)) {
             g_memory_serial.fetch_add(1, std::memory_order_relaxed);

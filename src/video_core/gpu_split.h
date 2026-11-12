@@ -117,6 +117,10 @@ public:
     static void MarkGpuThread() {
         on_gpu_thread = true;
     }
+    /// Whether the calling thread is the GPU thread (see MarkGpuThread).
+    [[nodiscard]] static bool OnGpuThread() {
+        return on_gpu_thread;
+    }
     [[nodiscard]] static bool OwnsScheduler() {
         return Get().BackRunning() ? on_back_thread : on_gpu_thread;
     }

@@ -34,6 +34,7 @@
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
+#include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -760,12 +761,14 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
     const VideoCommon::Nx2Profile::FineScope upload_scope{VideoCommon::Nx2Profile::Zone::CbUpload};
-    // Words memory holds already change nothing a draw reads (Nx2FastDraw::WriteData).
-    const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
-                      !FastDrawHeaderWrite(address + offset, address + offset + bytes);
-    if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address + offset,
-                                                      values.data(), bytes)) {
-        memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    if (!WriteBoundConstantBuffer(offset, values.data(), static_cast<u32>(bytes))) {
+        // Words memory holds already change nothing a draw reads (Nx2FastDraw::WriteData).
+        const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
+                          !FastDrawHeaderWrite(address + offset, address + offset + bytes);
+        if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address + offset,
+                                                          values.data(), bytes)) {
+            memory_manager.WriteWordsCached(address + offset, values.data(), count);
+        }
     }
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
@@ -1087,6 +1090,11 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
         VideoCommon::Nx2FastDraw::NoteBind(stage_index, bind_data.shader_slot);
     }
     buffer.enabled = bind_data.valid.Value() != 0;
+    if (VideoCommon::ListMacroTrace::g_enabled && buffer.enabled) {
+        VideoCommon::ListMacroTrace::NoteConstBufferBind(
+            static_cast<u32>(stage_index), bind_data.shader_slot, regs.const_buffer.Address(),
+            regs.const_buffer.size);
+    }
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
 
@@ -1100,6 +1108,74 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     rasterizer->BindGraphicsUniformBuffer(stage_index, bind_data.shader_slot, gpu_addr, size);
 }
 
+namespace {
+// Texture and sampler headers are read when image views are resolved, which delta draws skip.
+constexpr u64 FastDrawHeaderSize = 0x20;
+
+u64 FastDrawHeadersSize(const Maxwell3D::Regs& regs) {
+    return (u64{regs.tex_header.limit} + 1) * FastDrawHeaderSize;
+}
+
+// As TextureCache::SynchronizeDescriptors sizes the sampler table.
+u64 FastDrawSamplersSize(const Maxwell3D::Regs& regs) {
+    return (u64{regs.sampler_binding == Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding
+                    ? regs.tex_header.limit
+                    : regs.tex_sampler.limit} +
+            1) *
+           FastDrawHeaderSize;
+}
+} // Anonymous namespace
+
+bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes) {
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    if (!FastDraw::Enabled()) {
+        return false;
+    }
+    const GPUVAddr address = regs.const_buffer.Address();
+    const u32 size = regs.const_buffer.size;
+    const u64 map_serial = memory_manager.MapSerial();
+    const GPUVAddr tic = regs.tex_header.Address();
+    const u64 tic_size = FastDrawHeadersSize(regs);
+    const GPUVAddr tsc = regs.tex_sampler.Address();
+    const u64 tsc_size = FastDrawSamplersSize(regs);
+    BoundConstantBuffer& bound = bound_constant_buffer;
+    if (bound.address != address || bound.size != size || bound.map_serial != map_serial ||
+        bound.tic != tic || bound.tic_size != tic_size || bound.tsc != tsc ||
+        bound.tsc_size != tsc_size) {
+        bound = {address, size, map_serial, tic, tic_size, tsc, tsc_size, 0};
+        const GPUVAddr end = address + size;
+        const std::optional<DAddr> device =
+            address != 0 && size != 0 && memory_manager.IsContinuousRange(address, size)
+                ? memory_manager.GpuToCpuAddress(address)
+                : std::nullopt;
+        // Data anywhere in a buffer over the headers, at its GPU addresses or through another
+        // mapping of their device memory, takes the general path, which checks each write.
+        if (device && !(address < tic + tic_size && tic < end) &&
+            !(address < tsc + tsc_size && tsc < end)) {
+            fast_draw_header_spans.Update(memory_manager, tic, tic_size);
+            fast_draw_sampler_spans.Update(memory_manager, tsc, tsc_size);
+            if (!fast_draw_header_spans.Intersects(*device, *device + size) &&
+                !fast_draw_sampler_spans.Intersects(*device, *device + size)) {
+                bound.device = *device;
+            }
+        }
+    }
+    const GPUVAddr begin = address + offset;
+    // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.
+    if (bound.device == 0 ||
+        (begin + bytes > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+         begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        return false;
+    }
+    const DAddr device = bound.device + offset;
+    // Words memory holds already change nothing a draw reads (Nx2FastDraw::WriteData).
+    if (FastDraw::WriteData(memory_manager, begin, data, bytes)) {
+        return true;
+    }
+    memory_manager.WriteConstantBufferData(device, data, bytes);
+    return true;
+}
+
 void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
     if (!FastDrawHeaderWrite(begin, end)) {
         VideoCommon::Nx2FastDraw::NoteWrittenData(memory_manager, begin, nullptr, end - begin);
@@ -1108,17 +1184,10 @@ void Maxwell3D::NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end) {
 
 bool Maxwell3D::FastDrawHeaderWrite(GPUVAddr begin, GPUVAddr end) {
     namespace FastDraw = VideoCommon::Nx2FastDraw;
-    // Texture and sampler headers are read when image views are resolved, which delta draws skip.
-    constexpr u64 HeaderSize = 0x20;
     const GPUVAddr tic = regs.tex_header.Address();
-    const u64 tic_size = (u64{regs.tex_header.limit} + 1) * HeaderSize;
-    // As TextureCache::SynchronizeDescriptors sizes the sampler table.
+    const u64 tic_size = FastDrawHeadersSize(regs);
     const GPUVAddr tsc = regs.tex_sampler.Address();
-    const u64 tsc_size = (u64{regs.sampler_binding == Regs::SamplerBinding::ViaHeaderBinding
-                                  ? regs.tex_header.limit
-                                  : regs.tex_sampler.limit} +
-                          1) *
-                         HeaderSize;
+    const u64 tsc_size = FastDrawSamplersSize(regs);
     if ((begin < tic + tic_size && tic < end) || (begin < tsc + tsc_size && tsc < end)) {
         FastDraw::Break(FastDraw::Reason::TextureHeaders);
         return true;
@@ -1156,11 +1225,14 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
-                          !FastDrawHeaderWrite(address, address + write_size);
-        if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address, start_base,
-                                                          write_size)) {
-            memory_manager.WriteBlockCached(address, start_base, write_size);
+        if (!WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
+                                      static_cast<u32>(write_size))) {
+            const bool note = VideoCommon::Nx2FastDraw::Enabled() &&
+                              !FastDrawHeaderWrite(address, address + write_size);
+            if (!note || !VideoCommon::Nx2FastDraw::WriteData(memory_manager, address, start_base,
+                                                              write_size)) {
+                memory_manager.WriteBlockCached(address, start_base, write_size);
+            }
         }
     }
     if (write_size != copy_size) {
@@ -1984,7 +2056,15 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
-    if (!FrontRunOnBack(system, split, fs, engine, start)) {
+    namespace ListTrace = VideoCommon::ListMacroTrace;
+    ListTrace::Call* const trace =
+        ListTrace::g_enabled
+            ? ListTrace::BeginCall(ListTrace::Engine::Maxwell3D, static_cast<EngineInterface*>(this),
+                                   method, engine.native_code, engine.native_code_generation, start,
+                                   fs.parameters, native_data_ram, fs.regs)
+            : nullptr;
+    const bool on_back = FrontRunOnBack(system, split, fs, engine, start);
+    if (!on_back) {
         VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
         if (auto* channel = Nx2ListIndirect::FindChannel(&native_data_ram);
             channel != nullptr && !channel->words.empty()) {
@@ -1993,15 +2073,17 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         engine.native_interpreter.active_dram = &native_data_ram;
         const auto parameter_count = fs.parameters.size();
         const auto read = [&](u32 address) {
-            if (address >= Regs::NUM_REGS) {
-                return 0U;
-            }
-            return fs.back_owned[address] ? FrontRegister(split, fs, address) : fs.regs[address];
+            const u32 value = address >= Regs::NUM_REGS ? 0U
+                              : fs.back_owned[address] ? FrontRegister(split, fs, address)
+                                                       : fs.regs[address];
+            ListTrace::NoteRead(trace, address, value);
+            return value;
         };
         const auto emit = [&](u32 address, u32 value) {
             if (address >= MacroRegistersStart) {
                 return false;
             }
+            ListTrace::NoteWrite(trace, address, value);
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
             if (address == 0x157 || address == 0x158) {
@@ -2014,8 +2096,12 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             engine.native_jit = std::make_shared<TuringMacroJit>();
         }
         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
-        const auto result = engine.native_jit->Execute(
-            start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
+        const auto result =
+            trace != nullptr && trace->data_ram
+                ? engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read,
+                                                    emit)
+                : engine.native_jit->Execute(start, fs.parameters,
+                                             std::span<u32>{native_data_ram}, read, emit);
 #else
         const auto result =
             engine.native_interpreter.Execute(engine.native_code, start, fs.parameters, read, emit);
@@ -2025,6 +2111,10 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             LOG_ERROR(HW_GPU, "Native MME (split front) failed: start={:#x}, consumed={}/{}, error={}",
                       start, result.consumed, parameter_count, result.error);
         }
+    }
+    if (trace != nullptr) {
+        ListTrace::EndCall(*trace, on_back, engine.native_interpreter.data_ram_reads,
+                           engine.native_interpreter.data_ram_writes);
     }
     fs.parameters.clear();
     if (fs.draw_pending) {

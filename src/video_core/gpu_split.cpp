@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 
 #ifdef _MSC_VER
@@ -13,6 +14,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
+#ifdef __GLIBC__
+#include <execinfo.h>
 #endif
 #include <cstring>
 #include <string>
@@ -29,6 +33,7 @@
 #include "video_core/gpu_wait_stats.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_back_idle_trace.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
 
@@ -73,6 +78,13 @@ void Pause() {
     return "an engine";
 }
 
+BackIdleTrace::FrontState WaitState(DrainSite site) {
+    return site == DrainSite::ListWriters || site == DrainSite::ListSync ||
+                   site == DrainSite::ListFlush
+               ? BackIdleTrace::FrontState::Writers
+               : BackIdleTrace::FrontState::Drain;
+}
+
 } // Anonymous namespace
 
 void GpuSplit::CheckOwner(const char* where) {
@@ -108,7 +120,27 @@ void GpuSplit::CheckOwner(const char* where) {
     LOG_ERROR(HW_GPU, "GPU split owner check: {} on thread {} while the back runs; stack:{}",
               where, thread, stack);
 #else
-    (void)where;
+    // Also while the back is idle: its idle hook submits (Scheduler::FlushDeferred).
+    if (on_back_thread || !instance.back_running.load(std::memory_order_acquire)) {
+        return;
+    }
+    static std::atomic<u32> reports{};
+    if (reports.fetch_add(1) >= 12) {
+        return;
+    }
+    std::string stack;
+#ifdef __GLIBC__
+    void* frames[40];
+    const int count = backtrace(frames, 40);
+    if (char** const symbols = backtrace_symbols(frames, count)) {
+        for (int i = 1; i < count; ++i) {
+            stack += fmt::format("\n  {}", symbols[i]);
+        }
+        std::free(symbols);
+    }
+#endif
+    LOG_ERROR(HW_GPU, "GPU split owner check: {} on a thread other than the back; stack:{}", where,
+              stack);
 #endif
 }
 
@@ -284,6 +316,7 @@ void GpuSplit::Drain(DrainSite site) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    const BackIdleTrace::FrontWait idle_trace{WaitState(site)};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -561,6 +594,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
         return false;
     }
     Nx2Profile::Scope scope{Nx2Profile::Zone::WriterWait};
+    const BackIdleTrace::FrontWait idle_trace{WaitState(site)};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Ticks() : 0;
@@ -802,11 +836,16 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
     g_back_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
 #endif
     u64 read_position = 0;
+    const bool idle_trace = BackIdleTrace::Enabled();
+    u64 idle_since = 0;
     while (!stop_token.stop_requested()) {
         Nx2Profile::Report("GPU back thread", true);
         MaybeTick();
         u64 available = published.load(std::memory_order_acquire);
         if (available == read_position) {
+            if (idle_trace && idle_since == 0) {
+                idle_since = BackIdleTrace::Now();
+            }
             // The front publishes what it holds at its next commit (a few words) from now on.
             back_idle_at.store(read_position, std::memory_order_relaxed);
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
@@ -850,6 +889,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 back_waiting.store(false, std::memory_order_relaxed);
                 continue;
             }
+        }
+        if (idle_since != 0) {
+            BackIdleTrace::NoteBackIdle(idle_since, BackIdleTrace::Now());
+            idle_since = 0;
         }
         u64 last_store = read_position;
         while (read_position != available) {

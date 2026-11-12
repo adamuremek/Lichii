@@ -8,6 +8,7 @@ namespace Settings {
 
 inline constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
 inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+inline constexpr u64 HyruleWarriorsProgramId = 0x04003F40232DE000ULL;
 
 /// Ocarina of Time meets hundreds of new pipelines on entering an area. Waiting for each one held
 /// frames for up to 11 s (Ryzen 9 9900X, AMD driver); Bounded waited 0.1 s for a 152-pipeline

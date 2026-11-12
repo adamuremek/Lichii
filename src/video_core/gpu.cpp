@@ -306,6 +306,7 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
+        ++Stats::t_reads;
         // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
         // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
         if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {

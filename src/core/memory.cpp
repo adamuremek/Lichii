@@ -28,16 +28,19 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_wait_stats.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/gpu_wait_stats.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -882,6 +885,20 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        if (!Kernel::Nx2ThreadStats::g_enabled) {
+            DownloadFromRasterizer(v_address, size);
+            return;
+        }
+        auto& timing = system.CoreTiming();
+        const u64 start = timing.GetClockTicks();
+        const u64 reads = VideoCommon::GpuWaitStats::t_reads;
+        DownloadFromRasterizer(v_address, size);
+        Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
+                                            timing.GetClockTicks() - start,
+                                            VideoCommon::GpuWaitStats::t_reads != reads);
+    }
+
+    void DownloadFromRasterizer(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
@@ -924,6 +941,18 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
+        if (!Kernel::Nx2ThreadStats::g_enabled) {
+            WriteToRasterizer(v_address, size);
+            return;
+        }
+        auto& timing = system.CoreTiming();
+        const u64 start = timing.GetClockTicks();
+        WriteToRasterizer(v_address, size);
+        Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
+                                            timing.GetClockTicks() - start, false);
+    }
+
+    void WriteToRasterizer(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;

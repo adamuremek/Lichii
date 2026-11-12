@@ -21,6 +21,7 @@
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_stats.h"
+#include "video_core/nx2_list_macro_trace.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_read_trace.h"
@@ -68,6 +69,7 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
     VideoCommon::ReadTrace::ReadSwitch();
     Tegra::Nx2ListStats::ReadSwitches();
     VideoCommon::Nx2AcquireStats::ReadSwitch();
+    VideoCommon::ListMacroTrace::ReadSwitch();
     VideoCommon::Nx2Perf::ReadSwitch();
     Tegra::Nx2EntryCheck::ReadSwitch();
     Tegra::Nx2ListIndirect::ReadSwitch();
