@@ -86,6 +86,7 @@ add_executable(tests
     video_core/eviction_age.cpp
     video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
+    video_core/shader_reuse.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp
     video_core/frame_gen_choice.cpp

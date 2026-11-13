@@ -73,7 +73,13 @@ struct ConstBufferAddr {
 
 class Environment {
 public:
+    Environment() = default;
     virtual ~Environment() = default;
+
+    Environment(const Environment&) = default;
+    Environment& operator=(const Environment&) = default;
+    Environment(Environment&&) noexcept = default;
+    Environment& operator=(Environment&&) noexcept = default;
 
     [[nodiscard]] virtual u64 ReadInstruction(u32 address) = 0;
 
@@ -130,6 +136,12 @@ public:
                                                                                u32 offset) = 0;
 
     virtual void Dump(u64 pipeline_hash, u64 shader_hash) = 0;
+
+    /// Disk cache environments: forgets that a read lacked a recorded value.
+    virtual void ForgetLackedReads() {}
+
+    /// Whether translation read instructions outside the program's cached (hashed) code.
+    [[nodiscard]] virtual bool ReadUnboundInstructions() const { return false; }
 
     [[nodiscard]] const ProgramHeader& SPH() const noexcept {
         return sph;
