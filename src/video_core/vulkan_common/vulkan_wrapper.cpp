@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -533,13 +535,31 @@ void Image::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_IMAGE, name);
 }
 
+namespace {
+std::atomic<u64> traced_images_created{};
+std::atomic<u64> traced_images_reused{};
+std::atomic<u64> traced_images_destroyed{};
+
+bool TraceImages() {
+    static const bool enabled = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    return enabled;
+}
+
+void DestroyImage(VmaAllocator allocator, VkImage handle, VmaAllocation allocation) noexcept {
+    vmaDestroyImage(allocator, handle, allocation);
+    if (allocation != nullptr && TraceImages()) {
+        traced_images_destroyed.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+} // Anonymous namespace
+
 void Image::Release() const noexcept {
     if (handle) {
         if (recycle_key != 0 && allocation != nullptr &&
             ImageRecycler::Put(recycle_key, allocator, handle, allocation)) {
             return;
         }
-        vmaDestroyImage(allocator, handle, allocation);
+        DestroyImage(allocator, handle, allocation);
     }
 }
 
@@ -557,6 +577,7 @@ struct RecyclerState {
     std::mutex mutex;
     std::vector<RecycledImage> images; // oldest first
     u64 bytes = 0;
+    u64 pressure_evictions = 0;
     VmaAllocator closed{}; ///< Torn down: keeps nothing more of it
 };
 
@@ -597,7 +618,7 @@ void ReaperLoop(Graveyard& graveyard) {
             batch.swap(graveyard.images);
         }
         for (const RecycledImage& image : batch) {
-            vmaDestroyImage(image.allocator, image.handle, image.allocation);
+            DestroyImage(image.allocator, image.handle, image.allocation);
         }
         batch.clear();
     }
@@ -710,6 +731,9 @@ bool ImageRecycler::Take(u64 key, VmaAllocator allocator, VkImage& handle,
             allocation = image.allocation;
             state.bytes -= image.size;
             state.images.erase(state.images.begin() + static_cast<std::ptrdiff_t>(index));
+            if (TraceImages()) {
+                traced_images_reused.fetch_add(1, std::memory_order_relaxed);
+            }
             found = true;
             break;
         }
@@ -732,7 +756,35 @@ void ImageRecycler::Shrink(u64 bytes) noexcept {
     }
     // Kept bytes never pass the cap, so here bytes < cap: dropping the oldest until
     // `cap - bytes` more fit leaves at most `bytes`.
+    const size_t previous_count = state.images.size();
     TrimRecycler(state, RecyclerCap - bytes, std::chrono::steady_clock::now());
+    state.pressure_evictions += previous_count - state.images.size();
+}
+
+void ImageRecycler::RecordCreation() noexcept {
+    if (TraceImages()) {
+        traced_images_created.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void ImageRecycler::LogMemoryTrace() {
+    u64 kept_bytes;
+    size_t kept_count;
+    u64 pressure_evictions;
+    {
+        RecyclerState& state = Recycler();
+        std::scoped_lock lock{state.mutex};
+        kept_bytes = state.bytes;
+        kept_count = state.images.size();
+        pressure_evictions = std::exchange(state.pressure_evictions, 0);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Memory trace: backed Vulkan images since last sample: {} created, {} reused, {} "
+             "destroyed, {} evicted by pressure trim; recycler holds {} images ({} MiB)",
+             traced_images_created.exchange(0, std::memory_order_relaxed),
+             traced_images_reused.exchange(0, std::memory_order_relaxed),
+             traced_images_destroyed.exchange(0, std::memory_order_relaxed), pressure_evictions,
+             kept_count, kept_bytes >> 20);
 }
 
 void ImageRecycler::Open(VmaAllocator allocator) noexcept {
@@ -751,7 +803,7 @@ void ImageRecycler::Clear(VmaAllocator allocator) noexcept {
         if (image.allocator != allocator) {
             return false;
         }
-        vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        DestroyImage(image.allocator, image.handle, image.allocation);
         state.bytes -= image.size;
         return true;
     });
@@ -762,7 +814,7 @@ void ImageRecycler::Clear(VmaAllocator allocator) noexcept {
         if (image.allocator != allocator) {
             return false;
         }
-        vmaDestroyImage(image.allocator, image.handle, image.allocation);
+        DestroyImage(image.allocator, image.handle, image.allocation);
         return true;
     });
     // A batch being destroyed: wait for it.

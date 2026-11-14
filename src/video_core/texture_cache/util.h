@@ -38,6 +38,11 @@ struct OverlapResult {
 
 [[nodiscard]] u32 CalculateGuestSizeInBytes(const ImageInfo& info) noexcept;
 
+/// A full, unscaled B10G11R11 scene copy with no overlapping or partial image backing.
+[[nodiscard]] bool CanTransferWholeColorImage(const ImageBase& dst, const ImageBase& src,
+                                               GPUVAddr dst_addr, GPUVAddr src_addr,
+                                               Extent3D extent) noexcept;
+
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
 
 [[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
@@ -161,6 +166,10 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
 [[nodiscard]] bool IsBlockLinearSizeCompatible(const ImageInfo& new_info,
                                                const ImageInfo& overlap_info, u32 new_level,
                                                u32 overlap_level, bool strict_size) noexcept;
+
+/// Whether a block-linear 2D image is wider than tall by padding only: made as wide as it is
+/// tall, it takes the same guest memory with the same layout.
+[[nodiscard]] bool IsPaddedSquare(const ImageInfo& info) noexcept;
 
 [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,
                                          bool strict_size) noexcept;

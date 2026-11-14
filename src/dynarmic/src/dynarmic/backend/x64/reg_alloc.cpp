@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <utility>
@@ -300,6 +301,25 @@ HostLoc RegAlloc::UseScratchImpl(BlockOfCode& code, IR::Value use_value, std::bi
         if (LocInfo(current_location).IsLastUse()) {
             LocInfo(current_location).is_set_last_use = true;
         } else {
+            static const bool prefer_scratch_copy = [] {
+                const char* value = std::getenv("EDEN_NX2_JIT_SCRATCH_COPY");
+                return value && value[0] == '1' && value[1] == '\0';
+            }();
+            if (prefer_scratch_copy) {
+                // Keep the live operand in its register if the result can use an empty one.
+                constexpr auto reserved = BuildRegSet({HostLoc::RSP, HostLoc::RBP, HostLoc::R13,
+                                                       HostLoc::R14, HostLoc::R15});
+                u32 candidates = static_cast<u32>((desired_locations & ~reserved).to_ulong());
+                while (candidates != 0) {
+                    const auto candidate = static_cast<HostLoc>(std::countr_zero(candidates));
+                    if (LocInfo(candidate).IsEmpty()) {
+                        CopyToScratch(code, bit_width, candidate, current_location);
+                        LocInfo(candidate).WriteLock();
+                        return candidate;
+                    }
+                    candidates &= candidates - 1;
+                }
+            }
             MoveOutOfTheWay(code, current_location);
         }
         LocInfo(current_location).WriteLock();

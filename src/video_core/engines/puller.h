@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -15,6 +16,7 @@
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/nx2_semaphore_waiters.h"
 
 namespace Core {
 class System;
@@ -96,6 +98,11 @@ public:
         bool met{};
         bool flushed{}; ///< TEST (EDEN_NX2_ACQUIRE_STATS): a flush was sent for it
 
+        [[nodiscard]] static constexpr u64 UnnotedWriterPosition(u64 unplaced, u64 placed,
+                                                                 u64 noted) {
+            return (std::max)(unplaced, placed > noted ? placed : 0);
+        }
+
         [[nodiscard]] bool Matches(u32 current) const;
         /// Whether it waits for the word to reach `value` (greater or equal).
         [[nodiscard]] bool WaitsToReach() const;
@@ -172,6 +179,7 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    Nx2SemaphoreWaiters::Latch semaphore_latch;
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

@@ -143,7 +143,8 @@ void SetupDirtyStateEnable(Maxwell3D::DirtyState::Tables& tables) {
     setup(OFF(depth_write_enabled), DepthWriteEnable);
     setup(OFF(stencil_enable), StencilTestEnable);
     setup(OFF(primitive_restart.enabled), PrimitiveRestartEnable);
-    setup(OFF(rasterize_enable), RasterizerDiscardEnable);
+    // Rasterizer discard is recorded separately, and this word also changes the shader stages.
+    tables[0][OFF(rasterize_enable)] = RasterizerDiscardEnable;
     setup(OFF(polygon_offset_point_enable), DepthBiasEnable);
     setup(OFF(polygon_offset_line_enable), DepthBiasEnable);
     setup(OFF(polygon_offset_fill_enable), DepthBiasEnable);

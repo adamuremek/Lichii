@@ -38,6 +38,8 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    bool native_lse_atomics = false;
 };
 
 /**

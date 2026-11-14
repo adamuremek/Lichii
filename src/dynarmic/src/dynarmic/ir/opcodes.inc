@@ -720,6 +720,12 @@ A64OPC(ExclusiveWriteMemory16,                              U32,            U64,
 A64OPC(ExclusiveWriteMemory32,                              U32,            U64,            U64,            U32,            AccType         )
 A64OPC(ExclusiveWriteMemory64,                              U32,            U64,            U64,            U64,            AccType         )
 A64OPC(ExclusiveWriteMemory128,                             U32,            U64,            U64,            U128,           AccType         )
+#ifdef ARCHITECTURE_x86_64
+A64OPC(AtomicAddMemory32,                                   U32,            U64,            U64,            U32                             )
+A64OPC(AtomicAddMemory64,                                   U64,            U64,            U64,            U64                             )
+A64OPC(AtomicCasMemory32,                                   U32,            U64,            U64,            U32,            U32             )
+A64OPC(AtomicCasMemory64,                                   U64,            U64,            U64,            U64,            U64             )
+#endif
 
 // Remember to update:
 // - a32_emit_x64.cpp

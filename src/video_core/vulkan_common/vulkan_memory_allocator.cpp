@@ -359,6 +359,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
         image.SetRecycleKey(recycle_key);
     }
+    vk::ImageRecycler::RecordCreation();
     return VK_SUCCESS;
 }
 

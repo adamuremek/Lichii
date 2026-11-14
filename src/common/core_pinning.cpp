@@ -3,12 +3,15 @@
 
 #include <algorithm>
 #include <charconv>
+#include <iterator>
+#include <map>
 
 #include "common/core_pinning.h"
 
 namespace Common {
 
-GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processors) {
+GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processors,
+                                     size_t cache_local_guest_cores) {
     GpuThreadPinning plan;
     if (processors.empty()) {
         return plan;
@@ -40,6 +43,53 @@ GpuThreadPinning PlanGpuThreadPinning(std::span<const LogicalProcessor> processo
         } else {
             plan.guest.push_back(processor.id);
         }
+    }
+    if (cache_local_guest_cores == 0) {
+        return plan;
+    }
+
+    // Keep the default front and back cores. The worker shares their cache, and the guest cores
+    // share a second cache with enough distinct physical cores for every guest thread.
+    std::map<u32, std::map<u32, std::vector<u32>>> caches;
+    std::optional<u32> front_cache;
+    std::optional<u32> back_cache;
+    for (const auto& cpu : processors) {
+        if (cpu.efficiency_class != fastest) {
+            continue;
+        }
+        if (!cpu.last_level_cache) {
+            return plan;
+        }
+        const u32 cache = *cpu.last_level_cache;
+        caches[cache][cpu.core].push_back(cpu.id);
+        if (cpu.core == front_core) {
+            front_cache = cache;
+        } else if (cpu.core == back_core) {
+            back_cache = cache;
+        }
+    }
+    if (caches.size() != 2 || !front_cache || front_cache != back_cache) {
+        return plan;
+    }
+    const auto gpu_cache = caches.find(*front_cache);
+    const auto guest_cache = gpu_cache == caches.begin() ? std::next(gpu_cache) : caches.begin();
+    if (guest_cache->second.size() < cache_local_guest_cores) {
+        return plan;
+    }
+    const auto worker = std::ranges::find_if(gpu_cache->second, [&](const auto& entry) {
+        return entry.first != cores.front() && entry.first != front_core && entry.first != back_core;
+    });
+    if (worker == gpu_cache->second.end()) {
+        return plan;
+    }
+    plan.vulkan_worker = worker->second;
+    plan.guest.clear();
+    for (const auto& [core, ids] : guest_cache->second) {
+        if (plan.guest_by_core.size() == cache_local_guest_cores) {
+            break;
+        }
+        plan.guest_by_core.push_back(ids);
+        plan.guest.insert(plan.guest.end(), ids.begin(), ids.end());
     }
     return plan;
 }

@@ -57,6 +57,7 @@ public:
     static constexpr u32 MaxBytes = 4096; // BufferCache's DEFAULT_SKIP_CACHE_SIZE
     static constexpr size_t NumStages = 5;
     static constexpr size_t NumSlots = 18; // Maxwell constant buffers per stage
+    static constexpr size_t NumComputeSlots = 8;
 
     struct Slot {
         Ref ref{};
@@ -73,11 +74,19 @@ public:
                 slot.tick = 0;
             }
         }
+        for (Slot& slot : compute_slots) {
+            slot.size = 0;
+            slot.tick = 0;
+        }
+        compute_binds = compute_rebinds = 0;
     }
 
     std::array<std::array<Slot, NumSlots>, NumStages> slots{};
+    std::array<Slot, NumComputeSlots> compute_slots{};
     std::array<u8, MaxBytes> scratch{};
     u64 rebinds{}; ///< TEST: allocations bound again (EDEN_NX2_GPU_PROFILE=2 counts them)
+    u64 compute_binds{};
+    u64 compute_rebinds{};
 };
 
 template <class Ref>
@@ -95,21 +104,12 @@ inline void ResetUniformStreamReuse() noexcept {
     }
 }
 
-/// Binds the small uniform buffer at `device_addr` for (stage, cbuf `index`) through the stream
-/// buffer, reusing the slot's previous allocation when the bytes and the command buffer are the
-/// same. Returns false (nothing bound) when the buffer does not qualify, so the caller binds it
-/// the classic way.
 template <class Runtime, class DeviceMemory>
-[[nodiscard]] bool BindSmallUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
-                                           size_t stage, u32 index, u32 binding_index,
-                                           u64 device_addr, u32 size) {
-    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
-    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
-        index >= Reuse::NumSlots) {
-        return false;
-    }
-    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
-    typename Reuse::Slot& slot = reuse.slots[stage][index];
+void BindUniformStreamSlot(Runtime& runtime, DeviceMemory& device_memory,
+                           UniformStreamReuse<typename Runtime::StreamUniformRef>& reuse,
+                           typename UniformStreamReuse<typename Runtime::StreamUniformRef>::Slot& slot,
+                           size_t stage, u32 binding_index, u64 device_addr, u32 size,
+                           u64& rebinds) {
     // Guest memory in one piece of host memory (most of these buffers lie within a page) is
     // compared where it is; other ranges are gathered into scratch first.
     const u8* guest = nullptr;
@@ -124,8 +124,8 @@ template <class Runtime, class DeviceMemory>
     slot.device_addr = device_addr;
     if (same_bytes && slot.tick == runtime.CurrentTick()) {
         runtime.RebindStreamUniform(slot.ref, size);
-        ++reuse.rebinds;
-        return true;
+        ++rebinds;
+        return;
     }
     if (!same_bytes) {
         // The slot takes the bytes first and the stream gets the slot's: the guest may write its
@@ -138,6 +138,37 @@ template <class Runtime, class DeviceMemory>
     slot.ref = runtime.LastStreamUniformRef();
     // After the allocation: the tick the stream region is tagged with is the one current now.
     slot.tick = runtime.CurrentTick();
+}
+
+/// Binds a small graphics uniform and reuses its allocation when its bytes and tick match.
+template <class Runtime, class DeviceMemory>
+[[nodiscard]] bool BindSmallUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
+                                           size_t stage, u32 index, u32 binding_index,
+                                           u64 device_addr, u32 size) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    if (size == 0 || size > Reuse::MaxBytes || stage >= Reuse::NumStages ||
+        index >= Reuse::NumSlots) {
+        return false;
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    BindUniformStreamSlot(runtime, device_memory, reuse, reuse.slots[stage][index], stage,
+                          binding_index, device_addr, size, reuse.rebinds);
+    return true;
+}
+
+template <class Runtime, class DeviceMemory>
+[[nodiscard]] bool BindSmallComputeUniformReusing(Runtime& runtime, DeviceMemory& device_memory,
+                                                  u32 index, u32 binding_index, u64 device_addr,
+                                                  u32 size, bool needs_gpu_patch) {
+    using Reuse = UniformStreamReuse<typename Runtime::StreamUniformRef>;
+    // A GPU list patch needs a fresh allocation because it modifies the uniform after binding.
+    if (needs_gpu_patch || size == 0 || size > Reuse::MaxBytes || index >= Reuse::NumComputeSlots) {
+        return false;
+    }
+    Reuse& reuse = UniformStreamReuseState<typename Runtime::StreamUniformRef>();
+    BindUniformStreamSlot(runtime, device_memory, reuse, reuse.compute_slots[index], 0,
+                          binding_index, device_addr, size, reuse.compute_rebinds);
+    ++reuse.compute_binds;
     return true;
 }
 

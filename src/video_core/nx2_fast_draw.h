@@ -70,6 +70,14 @@ inline std::atomic<bool> g_enabled{true};
 /// by the pipeline cache.
 inline bool g_vertex_streams_dynamic{};
 
+struct RasterStateReuse {
+    bool enabled{};
+    bool cull_dynamic{};
+    bool depth_clamp_dynamic{};
+};
+
+inline RasterStateReuse g_raster_state_reuse{};
+
 /// Any thread: whether fast draws run (always, unless a test turned them off). The rasterizer
 /// latches it per draw (on the thread that draws) and starts with a full resolve when it turns on.
 [[nodiscard]] inline bool Enabled() {
@@ -93,9 +101,14 @@ inline void SetEnabledForTest(bool on) {
 inline std::atomic<u64> g_serial{1};
 /// The last break's reason and, for Register and Method, its 3D method (diagnostics).
 inline std::atomic<u32> g_last_break{};
+inline std::atomic<bool> g_track_full_uniforms{};
+inline std::atomic<u64> g_uniform_serial{1};
 
 inline void Break(Reason reason, u32 method = 0) {
     if (Enabled()) {
+        if (reason != Reason::Register && g_track_full_uniforms.load(std::memory_order_relaxed)) {
+            g_uniform_serial.fetch_add(1, std::memory_order_release);
+        }
         g_serial.fetch_add(1, std::memory_order_relaxed);
         g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
     }
@@ -103,6 +116,11 @@ inline void Break(Reason reason, u32 method = 0) {
 
 inline u64 Serial() {
     return g_serial.load(std::memory_order_relaxed);
+}
+
+/// Pure register writes do not change uniform contents.
+inline u64 UniformSerial() {
+    return g_uniform_serial.load(std::memory_order_acquire);
 }
 
 /// The device memory a GPU range maps to. A write through another GPU address that maps the

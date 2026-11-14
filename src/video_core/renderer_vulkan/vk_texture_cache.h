@@ -164,7 +164,10 @@ public:
     [[nodiscard]] std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(ImageView& input,
                                                                               ImageView& output);
 
-    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    bool CanTransferColorBlit(const Image& dst, const Image& src) const;
+
+    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies,
+                   bool sampled_by_graphics = false);
 
     void CopyImageMSAA(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 

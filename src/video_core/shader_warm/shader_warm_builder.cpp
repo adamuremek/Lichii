@@ -44,7 +44,8 @@ constexpr std::string_view StageConverting = "Converting";
 constexpr std::string_view StageWriting = "Writing";
 /// Conversions in flight (each holds a copy of its program).
 constexpr size_t MaxPendingJobs = 2048;
-constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
+// "PGP3": lists written before shared shader functions were built as calls are precached again
+constexpr u32 PrecachedPipelinesMagic = 0x33504750;
 
 fs::path TitleDir(u64 title_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
@@ -333,14 +334,15 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
     }
     return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
                      entries,   driver,
-                     device_id, cache_version};
+                     device_id, cache_version,
+                     WarmMarkerVersion};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
     std::ifstream in(WarmMarkerPath(warm_file));
     WarmStamp stamp;
     if (!(in >> stamp.size >> stamp.write_time >> stamp.entries >> stamp.driver >>
-          stamp.device_id >> stamp.cache_version)) {
+          stamp.device_id >> stamp.cache_version >> stamp.marker_version)) {
         return std::nullopt;
     }
     return stamp;
@@ -349,7 +351,8 @@ std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
 bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
     out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+        << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' ' << stamp.marker_version
+        << '\n';
     out.close();
     return static_cast<bool>(out);
 }

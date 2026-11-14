@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <string_view>
 
@@ -15,6 +16,7 @@
 #include "common/common_types.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/dkb_frame_trace.h"
+#include "common/gpu_benchmark_trial.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -22,6 +24,7 @@
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
+#include "video_core/renderer_vulkan/submission_policy.h"
 #include "video_core/renderer_vulkan/vk_back_split.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -34,6 +37,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/renderer_vulkan/vk_vertex_input_cache.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -212,6 +216,7 @@ private:
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
+    bool TrySubmitEarly(u32 budget);
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
 
@@ -257,6 +262,8 @@ private:
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
+    void BuildVertexInputLayout(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                                u32 max_bindings, VertexInputLayout& layout) const;
 
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
@@ -281,6 +288,8 @@ private:
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
     Scheduler& scheduler;
+    const bool cache_vertex_input;
+    VertexInputCache vertex_input_cache;
 
     StagingBufferPool staging_pool;
     DescriptorPool descriptor_pool;
@@ -306,6 +315,19 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    const bool adaptive_native_submit;
+    const bool configured_raster_state_reuse;
+    const bool configured_texture_read_filter;
+    std::atomic<bool> texture_read_filter;
+    const bool configured_buffer_read_filter;
+    std::atomic<bool> buffer_read_filter;
+    const Common::GpuBenchmarkTrial::Experiment benchmark_experiment;
+    std::atomic<u32> benchmark_request{};
+    u32 benchmark_acknowledged{};
+    bool benchmark_adaptive_submit;
+    SubmissionPolicy::WorkSinceSubmit adaptive_work;
+    u64 front_wait_submissions{};
+    u64 gpu_idle_submissions{};
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
     struct OcarinaMotionTrace {
@@ -452,6 +474,8 @@ private:
         std::array<u64, static_cast<size_t>(VideoCommon::Nx2FastDraw::Reason::Count)> breaks{};
         std::array<u32, Maxwell::NUM_REGS> break_methods{};
         u64 window_start{};
+        u64 same_handle_draws{};
+        u64 unused_vertex_type_draws{};
     };
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
     /// the remembered draw either way: only a recorded draw remembers one again.
@@ -470,6 +494,17 @@ private:
         handle_spans;
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
+    struct UniformDraw {
+        const Tegra::Engines::Maxwell3D* engine{};
+        size_t memory_id{};
+        u64 mapping{};
+        u64 serial{};
+
+        bool operator==(const UniformDraw&) const = default;
+    } previous_uniform_draw;
+    const bool keep_full_uniforms;
+    bool taken_handle_data_write{};
+    bool taken_unused_vertex_types{};
     FastDrawStats fast_draw_stats;
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};

@@ -34,6 +34,7 @@ enum class Type {
     CachedCPU,
     Untracked,
     Preflushable,
+    Hot,
     Max
 };
 
@@ -162,7 +163,7 @@ struct WordManager {
     /// @param query_cpu_range Base CPU address to loop over
     /// @param size            Size in bytes of the CPU range to loop over
     /// @param func            Function to call for each turned off region
-    template <typename Func>
+    template <bool KeepHot = false, typename Func>
     void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
         //static_assert(type != Type::Untracked);
         std::span<u64> state_words = Span(type);
@@ -178,6 +179,11 @@ struct WordManager {
         };
         CollectedRanges ranges;
         IterateWords(offset, size, [&](size_t index, u64 mask) {
+            if constexpr (KeepHot) {
+                // A hot upload is checked against the guest bytes separately. Leave its CPU
+                // and Untracked bits set so it won't be protected or skipped as clean.
+                mask &= ~Span(Type::Hot)[index];
+            }
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;

@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -163,6 +164,15 @@ public:
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
+    }
+
+    std::vector<VkDescriptorType> DescriptorTypes() const {
+        std::vector<VkDescriptorType> types;
+        types.reserve(num_descriptors);
+        for (const auto& entry : entries) {
+            types.insert(types.end(), entry.descriptorCount, entry.descriptorType);
+        }
+        return types;
     }
 
     DescriptorBufferLayout MakeDescriptorBufferLayout(VkDescriptorSetLayout layout) const {

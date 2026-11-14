@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_draw_bindings.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -41,6 +42,7 @@ struct GraphicsPipelineCacheKey {
     FixedPipelineState state;
 
     size_t Hash() const noexcept;
+    u64 VertexTypeGroupHash() const noexcept;
 
     bool operator==(const GraphicsPipelineCacheKey& rhs) const noexcept;
 
@@ -122,6 +124,15 @@ public:
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     u64 DynamicAttributeTypes() const noexcept { return key.state.attribute_types; }
+    bool MatchesDynamicAttributeTypes(u64 types) const noexcept {
+        return ((key.state.attribute_types ^ types) & vertex_attribute_type_mask) == 0;
+    }
+    bool CanReuseVertexTypes() const noexcept { return vertex_attribute_type_mask != ~u64{0}; }
+    const GraphicsPipelineCacheKey& Key() const noexcept { return key; }
+    bool MatchesVertexTypeVariant(const GraphicsPipelineCacheKey& other) const noexcept {
+        return CanReuseVertexTypes() && key.unique_hashes == other.unique_hashes &&
+               key.state.MatchesWithAttributeTypeMask(other.state, vertex_attribute_type_mask);
+    }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
@@ -223,15 +234,18 @@ public:
     GraphicsPipeline& operator=(const GraphicsPipeline&) = delete;
     GraphicsPipeline(const GraphicsPipeline&) = delete;
 
-    void AddTransition(GraphicsPipeline* transition);
+    void AddTransition(const GraphicsPipelineCacheKey& requested, GraphicsPipeline* transition);
 
     /// `back_split`: the draw's EDEN_NX2_BACK_SPLIT pool, or nullptr.
     bool Configure(bool is_indexed, BackSplit* back_split) {
         return configure_func(this, is_indexed, back_split);
     }
 
-    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key) noexcept {
-        if (key == current_key) {
+    [[nodiscard]] GraphicsPipeline* Next(const GraphicsPipelineCacheKey& current_key,
+                                         bool reuse_raster_state) noexcept {
+        if (key == current_key || MatchesVertexTypeVariant(current_key) ||
+            (reuse_raster_state && key.unique_hashes == current_key.unique_hashes &&
+             key.state.MatchesWithoutTrailingBlend(current_key.state))) {
             return this;
         }
         const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
@@ -308,6 +322,13 @@ public:
     /// reads constant and storage buffers) evaluates to another value now: a delta draw would keep
     /// views and samplers resolved from the old one.
     [[nodiscard]] bool ComputedHandlesChanged() const;
+
+    [[nodiscard]] bool HasDeltaTextureMemo() const noexcept {
+        return delta_texture_memo.has_value();
+    }
+
+    /// Rechecks the direct sampled textures kept by the last captured resolve, with caches locked.
+    [[nodiscard]] bool DeltaTextureMemoStillHolds() const;
 
     /// Why TakesDeltaDraws is false (diagnostics).
     enum class DeltaBlocker : u8 {
@@ -387,6 +408,7 @@ private:
     void Validate();
 
     const GraphicsPipelineCacheKey key;
+    const u64 vertex_attribute_type_mask;
     Tegra::Engines::Maxwell3D* maxwell3d;
     Tegra::MemoryManager* gpu_memory;
     const Device& device;
@@ -419,9 +441,11 @@ private:
     u32 color_output_mask{};
     bool writes_storage{};
     /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can
-    /// resolve them from texture_memo.
+    /// resolve them from a memo.
     bool texture_memo_eligible{};
-    VideoCommon::SampledTextureMemo texture_memo;
+    std::array<VideoCommon::SampledTextureMemo, 2> texture_memos;
+    u32 texture_memo_misses{};
+    size_t preferred_texture_memo{};
     bool writes_images{};
 
     DeltaBlocker delta_blocker{};
@@ -440,6 +464,7 @@ private:
         handle_word_index{};
     std::vector<VideoCommon::ImageViewInOut> delta_views;
     std::vector<VideoCommon::SamplerId> delta_samplers;
+    std::optional<size_t> delta_texture_memo;
     /// A handle the captured Configure computed at draw time: the descriptor it was read for
     /// (stage, kind as ComputedHandleKind, index in its list) and its value.
     struct ComputedHandle {
@@ -466,6 +491,8 @@ private:
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;
+    DrawPushConstants last_push_constants;
+    std::vector<VkDescriptorType> push_descriptor_types;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};

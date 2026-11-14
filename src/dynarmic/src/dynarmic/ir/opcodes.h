@@ -140,6 +140,12 @@ constexpr bool IsExclusiveMemoryRead(const Opcode op) noexcept {
     case Opcode::A64ExclusiveReadMemory32:
     case Opcode::A64ExclusiveReadMemory64:
     case Opcode::A64ExclusiveReadMemory128:
+#ifdef ARCHITECTURE_x86_64
+    case Opcode::A64AtomicAddMemory32:
+    case Opcode::A64AtomicAddMemory64:
+    case Opcode::A64AtomicCasMemory32:
+    case Opcode::A64AtomicCasMemory64:
+#endif
         return true;
 
     default:
@@ -159,6 +165,12 @@ constexpr bool IsExclusiveMemoryWrite(const Opcode op) noexcept {
     case Opcode::A64ExclusiveWriteMemory32:
     case Opcode::A64ExclusiveWriteMemory64:
     case Opcode::A64ExclusiveWriteMemory128:
+#ifdef ARCHITECTURE_x86_64
+    case Opcode::A64AtomicAddMemory32:
+    case Opcode::A64AtomicAddMemory64:
+    case Opcode::A64AtomicCasMemory32:
+    case Opcode::A64AtomicCasMemory64:
+#endif
         return true;
 
     default:

@@ -798,6 +798,8 @@ public:
     [[nodiscard]] static u64 KeptBytes() noexcept;
     /// Drops the oldest kept images until at most `bytes` are kept.
     static void Shrink(u64 bytes) noexcept;
+    static void RecordCreation() noexcept;
+    static void LogMemoryTrace();
 };
 
 struct MemoryLocation {

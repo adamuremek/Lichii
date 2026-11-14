@@ -128,9 +128,9 @@ void AddNVNStorageBuffers(IR::Program& program, const HostTranslateInfo& host_in
         })};
         if (it != descs.end()) {
             it->is_written |= program.info.stores_global_memory;
-            if (program.info.stores_global_memory) {
-                // A global store may land anywhere in it
-                it->write_extent = {};
+            if (program.info.stores_global_memory || !it->is_written) {
+                // A global access through the NVN table can land anywhere in the binding.
+                it->access_extent = {};
             }
             continue;
         }

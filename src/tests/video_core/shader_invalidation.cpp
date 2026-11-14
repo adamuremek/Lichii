@@ -2,6 +2,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -9,8 +10,14 @@
 #include <string_view>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "core/core.h"
 #include "core/device_memory.h"
+#include "tests/core/system_test_context.h"
+#include "video_core/dirty_flags.h"
+#include "video_core/gpu.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/renderer_null/null_rasterizer.h"
 #include "video_core/shader_cache.h"
 
 namespace VideoCommon {
@@ -25,6 +32,14 @@ struct ShaderCacheTestAccess {
     }
     static const ShaderInfo* Find(const ShaderCache& cache, VAddr address) {
         return cache.TryGet(address);
+    }
+    static void Attach(ShaderCache& cache, Tegra::Engines::Maxwell3D& engine,
+                       Tegra::MemoryManager& memory) {
+        cache.maxwell3d = &engine;
+        cache.gpu_memory = &memory;
+    }
+    static bool Refresh(ShaderCache& cache, std::array<u64, 6>& hashes) {
+        return cache.RefreshStages(hashes);
     }
     static void RegisterNative(ShaderCache& cache, VAddr address, u64 hash, u64 key) {
         auto data = std::make_unique<ShaderInfo>();
@@ -54,6 +69,109 @@ struct ShaderCacheTestAccess {
 } // namespace VideoCommon
 
 using VideoCommon::ShaderCacheTestAccess;
+
+namespace {
+struct GraphicsShaderFixture {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Tegra::MemoryManager gpu_memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::Engines::Maxwell3D engine{gpu_memory};
+    std::unique_ptr<VideoCommon::ShaderCache> cache = ShaderCacheTestAccess::Create(device_memory);
+
+    GraphicsShaderFixture() {
+        gpu_memory.BindRasterizer(&rasterizer);
+        engine.BindRasterizer(&rasterizer);
+        VideoCommon::Dirty::SetupDirtyFlags(engine.dirty.tables);
+        ShaderCacheTestAccess::Attach(*cache, engine, gpu_memory);
+    }
+};
+} // namespace
+
+TEST_CASE("Graphics shader refresh notices remaps and removals with clean registers",
+          "[shader_invalidation]") {
+    GraphicsShaderFixture fixture;
+    auto& gpu_memory = fixture.gpu_memory;
+    auto& engine = fixture.engine;
+    auto& cache = fixture.cache;
+    constexpr GPUVAddr address = 0x100000;
+    constexpr DAddr first = 0x200000;
+    constexpr DAddr second = 0x300000;
+    gpu_memory.Map(address, first, 0x1000, Tegra::PTEKind::PITCH, false);
+    engine.regs.program_region.address_low = static_cast<u32>(address);
+    ShaderCacheTestAccess::Register(*cache, first, 0x1000, 1);
+    ShaderCacheTestAccess::Register(*cache, second, 0x1000, 2);
+
+    constexpr size_t vertex = static_cast<size_t>(Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB);
+    std::array<u64, 6> hashes{};
+    REQUIRE(ShaderCacheTestAccess::Refresh(*cache, hashes));
+    CHECK(hashes[vertex] == 1);
+    CHECK_FALSE(engine.dirty.flags[VideoCommon::Dirty::Shaders]);
+    gpu_memory.Map(address, second, 0x1000, Tegra::PTEKind::PITCH, false);
+    REQUIRE(ShaderCacheTestAccess::Refresh(*cache, hashes));
+    CHECK(hashes[vertex] == 2);
+
+    cache->InvalidateRegion(second, 0x1000);
+    ShaderCacheTestAccess::Register(*cache, second, 0x1000, 3);
+    REQUIRE(ShaderCacheTestAccess::Refresh(*cache, hashes));
+    CHECK(hashes[vertex] == 3);
+}
+
+TEST_CASE("Graphics shader refresh cost after register-count writes",
+          "[.shader_register_refresh_bench]") {
+    GraphicsShaderFixture fixture;
+    using Tegra::Engines::Maxwell3D;
+    auto& engine = fixture.engine;
+    auto& cache = *fixture.cache;
+    constexpr GPUVAddr address = 0x100000;
+    constexpr DAddr device_address = 0x200000;
+    fixture.gpu_memory.Map(address, device_address, 0x3000, Tegra::PTEKind::PITCH, false);
+    engine.regs.program_region.address_low = static_cast<u32>(address);
+    constexpr size_t pixel = static_cast<size_t>(Maxwell3D::Regs::ShaderType::Pixel);
+    engine.regs.pipelines[pixel].enable.Assign(1);
+    engine.regs.pipelines[pixel].offset = 0x1000;
+    for (u32 page = 0; page < 3; ++page) {
+        ShaderCacheTestAccess::Register(cache, device_address + page * 0x1000, 0x1000, page + 1);
+    }
+
+    constexpr u32 count_method = 0x853;
+    constexpr u32 offset_method = MAXWELL3D_REG_INDEX(pipelines) +
+                                  (pixel * sizeof(Maxwell3D::Regs::Pipeline) +
+                                   offsetof(Maxwell3D::Regs::Pipeline, offset)) /
+                                      sizeof(u32);
+    auto& count_flag = engine.dirty.tables[0][count_method];
+    REQUIRE(count_flag == VideoCommon::Dirty::NullEntry);
+    std::array<u64, 6> hashes{};
+    REQUIRE(ShaderCacheTestAccess::Refresh(cache, hashes));
+    for (const bool mixed : {false, true}) {
+        for (const bool legacy : {true, false}) {
+            count_flag = legacy ? VideoCommon::Dirty::Shaders : VideoCommon::Dirty::NullEntry;
+            constexpr u32 iterations = 128'000;
+            u64 checksum = 0;
+            u32 failures = 0;
+            const auto begin = std::chrono::steady_clock::now();
+            for (u32 i = 0; i < iterations; ++i) {
+                engine.CallMethod(fixture.system, count_method, (i & 31) + 1, true);
+                if (mixed && (i & 15) == 0) {
+                    const u32 offset = (i & 16) == 0 ? 0x1000 : 0x2000;
+                    engine.CallMethod(fixture.system, offset_method, offset, true);
+                }
+                failures += !ShaderCacheTestAccess::Refresh(cache, hashes);
+                checksum += hashes[pixel];
+            }
+            const std::chrono::duration<double, std::nano> elapsed =
+                std::chrono::steady_clock::now() - begin;
+            CHECK(failures == 0);
+            CHECK(checksum == (mixed ? iterations * 5 / 2 : iterations * 2));
+            std::printf("%s writes, %s: %.2f ns per refresh\n", mixed ? "mixed" : "metadata",
+                        legacy ? "legacy dirty flag" : "current dirty flag",
+                        elapsed.count() / iterations);
+        }
+    }
+}
 
 TEST_CASE("Shader batch invalidation matches sequential cache contents", "[shader_invalidation]") {
     Core::DeviceMemory memory;

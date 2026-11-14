@@ -235,7 +235,7 @@ public:
 
     std::span<GPUDirtyMemoryManager> GetGPUDirtyMemoryManager();
 
-    void GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback);
+    void GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback, bool skip_empty);
 
     [[nodiscard]] size_t GetCurrentHostThreadID() const;
 

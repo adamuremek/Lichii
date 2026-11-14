@@ -12,6 +12,7 @@ add_executable(tests
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/spirv_inline_control.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
@@ -32,11 +33,13 @@ add_executable(tests
     video_core/ampere_yoshi_compute.cpp
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
+    video_core/padded_square.cpp
     audio_core/batch_decoder.cpp
     audio_core/adpcm_decode.cpp
     audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
+    core/gpu_dirty_memory_manager.cpp
     core/memory_acquire.cpp
     core/builtin_patches.cpp
     core/builtin_font_glyphs.cpp
@@ -56,11 +59,13 @@ add_executable(tests
     core/vfs_vector.cpp
     core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
+    input_common/tas_route.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
     video_core/native_texture_header_index.cpp
     video_core/texture_alias_ticks.cpp
     video_core/sampled_views.cpp
+    video_core/scene_transfer_copy.cpp
     video_core/texture_handles.cpp
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
@@ -198,6 +203,9 @@ add_executable(tests
     video_core/turing_macro_effects.cpp
     video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
+    video_core/vk_staging_buffer_policy.cpp
+    video_core/vk_vertex_input_cache.cpp
+    video_core/vk_draw_bindings.cpp
     video_core/upload_order.cpp
     video_core/usage_tracker.cpp
     video_core/shader_invalidation.cpp
@@ -212,6 +220,7 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/stale_pages.cpp
+    video_core/superseded_images.cpp
     input_common/calibration_configuration_job.cpp
 )
 
@@ -221,7 +230,7 @@ target_link_libraries(tests PRIVATE common core audio_core input_common video_co
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
-    target_sources(tests PRIVATE core/window_trace.cpp)
+    target_sources(tests PRIVATE core/jit_ordered_loads.cpp core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 

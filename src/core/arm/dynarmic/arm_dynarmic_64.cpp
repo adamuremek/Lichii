@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <string_view>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -456,6 +457,21 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(ARCHITECTURE_x86_64)
+    static const bool native_lse = [] {
+        const char* value = std::getenv("EDEN_NX2_NATIVE_LSE");
+        return value && std::string_view{value} == "1";
+    }();
+    const auto* process = m_cb->m_process;
+    if (native_lse && process && process->GetProgramId() == 0x0400486024DEC000ULL) {
+        config.native_lse_atomics = config.fastmem_pointer && config.fastmem_exclusive_access &&
+            !config.check_halt_on_memory_access &&
+            config.HasOptimization(Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
+        if (m_core_index == 0) {
+            LOG_INFO(Core_ARM, "Ocarina native x64 LDADD/CAS enabled: {}", config.native_lse_atomics);
+        }
+    }
+#endif
     m_jit.emplace(config);
 }
 

@@ -199,6 +199,13 @@ public:
     size_t GetMemoryLayoutSize(GPUVAddr gpu_addr,
                                size_t max_size = (std::numeric_limits<size_t>::max)()) const;
 
+    struct BufferMappingSizes {
+        size_t layout;
+        size_t continuous;
+    };
+    /// The layout and device-contiguous sizes starting at a storage buffer's address.
+    BufferMappingSizes GetBufferMappingSizes(GPUVAddr gpu_addr) const;
+
     /// GetMemoryLayoutSize from the kind map under its lock (the answer with Nx2Perf off).
     size_t GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const;
 
@@ -226,7 +233,26 @@ private:
         };
         std::vector<Run> runs;
         std::vector<std::pair<s64, PTEKind>> kinds;
+
+        size_t ContinuousRemaining(GPUVAddr address) const;
+        size_t LayoutRemaining(s64 address) const;
     };
+
+    struct MappingInterval {
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        bool mapped{};
+
+        bool Contains(GPUVAddr address) const {
+            return begin <= address && address < end;
+        }
+
+        size_t Remaining(GPUVAddr address) const {
+            return mapped ? end - address : 0;
+        }
+    };
+    MappingInterval FindContinuousInterval(GPUVAddr address) const;
+    MappingInterval FindLayoutInterval(GPUVAddr address) const;
 
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);

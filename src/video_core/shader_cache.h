@@ -186,6 +186,16 @@ private:
     std::vector<std::unique_ptr<ShaderInfo>> storage;
     std::vector<Entry*> marked_for_removal;
 
+    struct ShaderSources {
+        const Tegra::Engines::Maxwell3D* engine{};
+        size_t address_space{};
+        u64 mapping{};
+        u64 invalidation{};
+
+        bool operator==(const ShaderSources&) const = default;
+    } shader_sources;
+    std::atomic<u64> shader_invalidation{};
+
     /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
     /// first error instead of lowering again; dropped when guest memory there is written.
     std::mutex rejected_mutex;

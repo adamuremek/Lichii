@@ -26,6 +26,7 @@ class TuringMacroJit {
 public:
     using Word = std::uint32_t;
     using Result = TuringMacroInterpreter::Result;
+    static constexpr Word WriteBatchCapacity = 32;
 
     struct State {
         std::array<Word, 24> regs;
@@ -53,6 +54,8 @@ public:
         bool (*emit)(State*, Word method, Word value);
         Word (*read)(State*, Word address);
         const std::vector<Word>* fifo;
+        Word write_count;
+        std::array<std::array<Word, 2>, WriteBatchCapacity> writes;
     };
 
     enum Error : Word {
@@ -90,13 +93,16 @@ public:
         return error < texts.size() ? texts[error] : "unknown";
     }
 
-    /// Compiles `code` (3 words per instruction) when it differs from what was compiled.
-    void Prepare(std::span<const Word> code, std::uint64_t generation) {
-        if (program && generation == compiled_generation) {
-            return;
+    /// A batching caller must accept all methods below 0xe00. Only DMA methods 0x157 and 0x158
+    /// may change the parameter FIFO or data RAM from inside its emit callback.
+    void Prepare(std::span<const Word> code, std::uint64_t generation, bool batch_writes = false) {
+        // The compute front can share this JIT and requests the immediate program.
+        const size_t mode = batch_writes ? 1 : 0;
+        if (!programs[mode] || generation != compiled_generations[mode]) {
+            programs[mode] = std::make_unique<Program>(code, batch_writes);
+            compiled_generations[mode] = generation;
         }
-        program = std::make_unique<Program>(code);
-        compiled_generation = generation;
+        program = programs[mode].get();
     }
 
     template <typename Read, typename Emit>
@@ -115,11 +121,22 @@ public:
         state.params_size = static_cast<Word>(parameters.size());
         state.dram = data_ram.data();
         state.fifo = &parameters;
+        using Callbacks = Thunks<Read, Emit>;
         Thunks<Read, Emit> thunks{read, emit};
         state.user = &thunks;
-        state.emit = &Thunks<Read, Emit>::CallEmit;
-        state.read = &Thunks<Read, Emit>::CallRead;
+        const bool batching = program->batch_writes;
+        if (batching) {
+            state.write_count = 0;
+            state.emit = &Callbacks::EmitAfterWrites;
+            state.read = &Callbacks::ReadAfterWrites;
+        } else {
+            state.emit = &Callbacks::CallEmit;
+            state.read = &Callbacks::CallRead;
+        }
         const Word error = program->entry(&state);
+        if (batching) {
+            Callbacks::FlushWrites(&state);
+        }
         if (error == None) {
             return {true, state.fail_pc, state.consumed, {}};
         }
@@ -141,17 +158,35 @@ private:
         static Word CallRead(State* state, Word address) {
             return static_cast<Thunks*>(state->user)->read(address);
         }
+        static void FlushWrites(State* state) {
+            auto& emit = static_cast<Thunks*>(state->user)->emit;
+            const Word count = state->write_count;
+            state->write_count = 0;
+            for (Word i = 0; i < count; ++i) {
+                const auto [method, value] = state->writes[i];
+                emit(method, value);
+            }
+        }
+        static bool EmitAfterWrites(State* state, Word method, Word value) {
+            FlushWrites(state);
+            return CallEmit(state, method, value);
+        }
+        static Word ReadAfterWrites(State* state, Word address) {
+            FlushWrites(state);
+            return CallRead(state, address);
+        }
     };
 
     struct Program : Xbyak::CodeGenerator {
-        explicit Program(std::span<const Word> code)
-            : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow) {
+        explicit Program(std::span<const Word> code, bool batch_writes_)
+            : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow), batch_writes{batch_writes_} {
             Generate(code);
             ready();
             entry = getCode<Word (*)(State*)>();
         }
 
         Word (*entry)(State*) = nullptr;
+        const bool batch_writes;
 
     private:
         using Decoded = TuringMacroInterpreter::Decoded;
@@ -391,12 +426,34 @@ private:
                 }
                 if (d.out_emit[lane]) {
                     Output(eax, d, d.out_emit[lane]);
+                    Xbyak::Label immediate, emitted;
+                    if (batch_writes) {
+                        mov(ecx, dword[st + offsetof(State, method)]);
+                        mov(edx, dword[st + offsetof(State, write_count)]);
+                        cmp(edx, WriteBatchCapacity);
+                        jae(immediate);
+                        cmp(ecx, 0xe00);
+                        jae(immediate);
+                        mov(r8d, ecx);
+                        sub(r8d, 0x157);
+                        cmp(r8d, 1);
+                        jbe(immediate);
+                        mov(dword[st + rdx * 8 + offsetof(State, writes)], ecx);
+                        mov(dword[st + rdx * 8 + offsetof(State, writes) + sizeof(Word)], eax);
+                        inc(edx);
+                        mov(dword[st + offsetof(State, write_count)], edx);
+                        jmp(emitted);
+                        L(immediate);
+                    }
                     mov(arg2.cvt32(), eax);
                     mov(arg1.cvt32(), dword[st + offsetof(State, method)]);
                     mov(arg0, st);
                     call(ptr[st + offsetof(State, emit)]);
                     test(al, al);
                     jz(fail_emit, T_NEAR);
+                    if (batch_writes) {
+                        L(emitted);
+                    }
                     mov(eax, dword[st + offsetof(State, increment)]);
                     add(dword[st + offsetof(State, method)], eax);
                 }
@@ -655,8 +712,9 @@ private:
             fail_loop, fail_dread, fail_dwrite, fail_output, fail_emit, fail_outside, fail_steps;
     };
 
-    std::unique_ptr<Program> program;
-    std::uint64_t compiled_generation{~std::uint64_t{0}};
+    std::array<std::unique_ptr<Program>, 2> programs;
+    std::array<std::uint64_t, 2> compiled_generations{};
+    Program* program{};
 };
 
 } // namespace Tegra

@@ -25,6 +25,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_semaphore_waiters.h"
 #include "video_core/query_cache/bank_base.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_cache/query_base.h"

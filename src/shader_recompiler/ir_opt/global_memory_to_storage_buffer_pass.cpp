@@ -101,6 +101,7 @@ struct StorageInfo {
     StorageBufferSet unbounded_writes;
     /// A store or atomic stayed global without a buffer: it may land in any written buffer
     bool untracked_writes{};
+    bool untracked_access{};
 };
 
 /// Returns true when the instruction is a global memory instruction
@@ -1484,15 +1485,20 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     return true;
 }
 
-/// Bytes a global store or atomic writes
-u32 StoreSize(IR::Opcode opcode) {
+/// Bytes a global memory instruction accesses.
+u32 AccessSize(IR::Opcode opcode) {
     switch (opcode) {
+    case IR::Opcode::LoadGlobalS8:
+    case IR::Opcode::LoadGlobalU8:
     case IR::Opcode::WriteGlobalS8:
     case IR::Opcode::WriteGlobalU8:
         return 1;
+    case IR::Opcode::LoadGlobalS16:
+    case IR::Opcode::LoadGlobalU16:
     case IR::Opcode::WriteGlobalS16:
     case IR::Opcode::WriteGlobalU16:
         return 2;
+    case IR::Opcode::LoadGlobal64:
     case IR::Opcode::WriteGlobal64:
     case IR::Opcode::GlobalAtomicIAdd64:
     case IR::Opcode::GlobalAtomicSMin64:
@@ -1516,6 +1522,7 @@ u32 StoreSize(IR::Opcode opcode) {
     case IR::Opcode::GlobalAtomicMinF32x2:
     case IR::Opcode::GlobalAtomicMaxF32x2:
         return 8;
+    case IR::Opcode::LoadGlobal128:
     case IR::Opcode::WriteGlobal128:
         return 16;
     default:
@@ -1545,23 +1552,25 @@ struct IdBound {
     }
 };
 
-/// Proves where a program's stores to one storage buffer can land relative to its pointer word.
+/// Proves where a program's accesses to one storage buffer can land relative to its pointer word.
 /// Anything not provably affine in the invocation and workgroup ids with constant non-negative
 /// strides (a value loaded from memory or read from another constant buffer word, a loop-carried
 /// index, a signed or 64-bit computation) leaves the extent unknown.
-class StoreExtentAnalysis {
+class StorageExtentAnalysis {
 public:
-    explicit StoreExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
+    explicit StorageExtentAnalysis(StorageBufferAddr buffer_, const std::array<u32, 3>& workgroup_)
         : buffer{buffer_}, workgroup{workgroup_} {}
 
-    /// Extent of one store, merged into `extent`
-    void AddStore(IR::Inst& inst, StorageWriteExtent& extent) {
-        const std::optional<StorageWriteExtent> store{StoreExtent(inst)};
-        if (!store) {
-            extent = StorageWriteExtent{};
+    void AddAccess(IR::Inst& inst, StorageAccessExtent& extent) {
+        if (!extent.bounded) {
             return;
         }
-        MergeStorageWriteExtent(extent, *store);
+        const std::optional<StorageAccessExtent> access{AccessExtent(inst)};
+        if (!access) {
+            extent = StorageAccessExtent{};
+            return;
+        }
+        MergeStorageAccessExtent(extent, *access);
     }
 
 private:
@@ -1569,22 +1578,23 @@ private:
     static constexpr u64 COEF_LIMIT = u64{1} << 32;
     static constexpr u32 MAX_DEPTH = 256;
 
-    std::optional<StorageWriteExtent> StoreExtent(IR::Inst& inst) {
+    std::optional<StorageAccessExtent> AccessExtent(IR::Inst& inst) {
         const std::optional<LowAddrInfo> addr{TrackLowAddress(&inst)};
         if (!addr) {
             return std::nullopt;
         }
         const std::optional<IdBound> low{Evaluate(addr->value, 0)};
-        if (!low || low->base != 1 || guard_failed) {
+        if (!low || low->base != 1 || guard_failed ||
+            (!IsGlobalMemoryWrite(inst) && !low->exact)) {
             return std::nullopt;
         }
         // Below zero, invocation 0's offset wraps modulo 2^32 (see IdBound).
         const s64 start{low->c + addr->imm_offset};
-        const s64 end{start + StoreSize(inst.GetOpcode())};
+        const s64 end{start + AccessSize(inst.GetOpcode())};
         if (start < 0 || end > s64{0xffffffff}) {
             return std::nullopt;
         }
-        StorageWriteExtent result{
+        StorageAccessExtent result{
             .bounded = true,
             .const_end = static_cast<u32>(end),
         };
@@ -2099,6 +2109,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                 conditions.current = block;
                 const bool bound{CollectStorageBuffers(*block, inst, info, env, conditions)};
                 info.untracked_writes |= !bound && IsGlobalMemoryWrite(inst);
+                info.untracked_access |= !bound;
             }
         }
     };
@@ -2135,28 +2146,27 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                       info.set.size(), max_ssbos);
     }
     program.info.native_global_bounds |= info.native_runtime_bounds;
-    // Store extents, before the accesses are rebased (the analysis reads the guest addresses).
-    // None while a store stays global: the backend routes it to the descriptor whose pointer is the
-    // closest one at or below the address, which need not be one of the store's candidates.
-    std::map<StorageBufferAddr, StorageWriteExtent> extents;
-    if (!info.untracked_writes && info.unbounded_writes.empty()) {
-        std::map<StorageBufferAddr, StoreExtentAnalysis> analyses;
+    // Use the original guest addresses. A surviving global access can reach a different
+    // descriptor at runtime, so do not use read bounds when any access stays global.
+    const bool bound_reads = env.IsNativeProgram() && program.stage == Stage::Compute &&
+                             !program.info.native_global_bounds && !info.untracked_access;
+    const bool bound_writes = !info.untracked_writes && info.unbounded_writes.empty();
+    std::map<StorageBufferAddr, StorageAccessExtent> extents;
+    if (bound_reads || bound_writes) {
+        std::map<StorageBufferAddr, StorageExtentAnalysis> analyses;
         for (const StorageInst& storage_inst : info.to_replace) {
-            if (!IsGlobalMemoryWrite(*storage_inst.inst) ||
-                info.unbounded_writes.contains(storage_inst.storage_buffer)) {
+            const auto& buffer = storage_inst.storage_buffer;
+            const bool written = info.writes.contains(buffer);
+            if (written ? !bound_writes || !IsGlobalMemoryWrite(*storage_inst.inst)
+                        : !bound_reads || buffer.indirect != ~0U) {
                 continue;
             }
-            auto analysis{analyses.find(storage_inst.storage_buffer)};
-            if (analysis == analyses.end()) {
-                analysis = analyses
-                               .emplace(storage_inst.storage_buffer,
-                                        StoreExtentAnalysis{storage_inst.storage_buffer,
-                                                            program.workgroup_size})
-                               .first;
-                // An empty bounded extent, widened by every store
-                extents.emplace(storage_inst.storage_buffer, StorageWriteExtent{.bounded = true});
+            auto [analysis, inserted] = analyses.try_emplace(buffer, buffer, program.workgroup_size);
+            auto& extent = extents[buffer];
+            if (inserted) {
+                extent.bounded = true;
             }
-            analysis->second.AddStore(*storage_inst.inst, extents[storage_inst.storage_buffer]);
+            analysis->second.AddAccess(*storage_inst.inst, extent);
         }
     }
     for (const StorageBufferAddr& storage_buffer : info.set) {
@@ -2168,8 +2178,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .count = 1,
             .is_written = is_written,
             .indirect_offset = storage_buffer.indirect,
-            .write_extent = is_written && extent != extents.end() ? extent->second
-                                                                  : StorageWriteExtent{},
+            .access_extent = extent != extents.end() ? extent->second : StorageAccessExtent{},
         });
     }
     for (const StorageInst& storage_inst : info.to_replace) {
@@ -2208,10 +2217,12 @@ void JoinStorageInfo(Info& base, Info& source, size_t limit) {
         if (it != descriptors.end()) {
             if (desc.is_written) {
                 if (it->is_written) {
-                    MergeStorageWriteExtent(it->write_extent, desc.write_extent);
+                    MergeStorageAccessExtent(it->access_extent, desc.access_extent);
                 } else {
-                    it->write_extent = desc.write_extent;
+                    it->access_extent = desc.access_extent;
                 }
+            } else if (!it->is_written) {
+                MergeStorageAccessExtent(it->access_extent, desc.access_extent);
             }
             it->is_written |= desc.is_written;
             continue;

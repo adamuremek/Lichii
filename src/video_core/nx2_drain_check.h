@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_semaphore_waiters.h"
 
 // EDEN_NX2_DRAIN_CHECK: what the split GPU thread's front would see without some of its waits for
 // the back, counted without changing what runs and logged every 10 s by the front:

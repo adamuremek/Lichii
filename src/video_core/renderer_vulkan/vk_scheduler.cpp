@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
+#include "common/core_pinning.h"
 #include "common/settings.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/thread.h"
@@ -48,6 +49,7 @@ namespace {
 std::atomic<u64> g_profile_submits{};
 std::atomic<u64> g_profile_renderpasses{};
 std::atomic<u64> g_profile_finishes{};
+std::atomic<u64> g_profile_skipped_flushes{};
 std::atomic<u64> g_profile_finish_ns{};
 std::atomic<u64> g_profile_window_start{};
 std::mutex g_profile_end_mutex;
@@ -75,11 +77,12 @@ void ReportSubmitCounts() {
     const double seconds = static_cast<double>(now - start) / 1e9;
     LOG_INFO(Render_Vulkan,
              "Scheduler per second: {:.0f} submits, {:.0f} render passes, {:.0f} finishes "
-             "waiting {:.1f} ms",
+             "waiting {:.1f} ms, {:.0f} empty flushes skipped",
              static_cast<double>(g_profile_submits.exchange(0)) / seconds,
              static_cast<double>(g_profile_renderpasses.exchange(0)) / seconds,
              static_cast<double>(g_profile_finishes.exchange(0)) / seconds,
-             static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds);
+             static_cast<double>(g_profile_finish_ns.exchange(0)) / 1e6 / seconds,
+             static_cast<double>(g_profile_skipped_flushes.exchange(0)) / seconds);
     std::map<std::string, u64> named;
     {
         std::scoped_lock lock{g_profile_end_mutex};
@@ -122,6 +125,10 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
 
 Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
     : device{device_}, state_tracker{state_tracker_},
+      reuse_draw_bindings{[] {
+          const char* value = std::getenv("EDEN_NX2_REUSE_DRAW_BINDINGS");
+          return value && value[0] == '1';
+      }()},
       master_semaphore{std::make_unique<MasterSemaphore>(device)},
       command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
       upload_batch{std::make_unique<UploadBatch>()},
@@ -415,9 +422,16 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     // When flushing, we only send data to the worker thread; no waiting is necessary.
     const u64 signal_value = SubmitExecution(signal_semaphore, wait_semaphore, location);
     AllocateNewContext();
+    submitted_serial = record_serial;
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
     return signal_value;
+}
+
+void Scheduler::CountSkippedFlush() {
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        g_profile_skipped_flushes.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 bool Scheduler::DeferFlush() {
@@ -494,6 +508,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     SubmitExecution(signal_semaphore, wait_semaphore, location);
     Wait(presubmit_tick);
     AllocateNewContext();
+    submitted_serial = record_serial;
     VideoCommon::GpuWaitStats::AddHostWait(VideoCommon::GpuWaitStats::Now() - wait_start);
     last_flush = std::chrono::steady_clock::now();
     flush_pending = false;
@@ -824,6 +839,12 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         VideoCommon::StutterTrace::Thread::Worker};
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
+    const bool pin_gpu_threads = Settings::values.pin_gpu_threads.GetValue();
+    if (pin_gpu_threads) {
+        Common::PinCurrentVulkanWorker();
+    }
+    const Common::CpuPlacementTrialThread placement{Common::DkbCpuTrace::Role::VulkanWorker,
+                                                   pin_gpu_threads};
 
     const auto TryPopQueue{[this](auto& work) -> bool {
         if (work_queue.empty()) {

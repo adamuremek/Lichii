@@ -43,7 +43,7 @@ struct A64EmitContext final : public EmitContext {
 
 class A64EmitX64 final : public EmitX64 {
 public:
-    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface);
+    A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface, A64JitState& jit_state);
     ~A64EmitX64() override;
 
     /// Emit host machine code for a basic block with intermediate representation `block`.
@@ -98,6 +98,8 @@ public:
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
+    template<typename T, bool cas>
+    void EmitAtomicMemory(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
     void EmitMemoryRead(A64EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>
@@ -124,6 +126,7 @@ public:
 
 //data
     const A64::UserConfig conf;
+    A64JitState& jit_state;
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u64> block_ranges;
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;

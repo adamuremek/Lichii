@@ -85,6 +85,18 @@ bool TranslatorVisitor::AtomicMemOp(Imm<2> size, bool A, bool R, Reg Rs, Imm<4> 
     }
 
     const IR::U64 address = AtomicAddress(*this, Rn);
+#ifdef ARCHITECTURE_x86_64
+    if (options.native_lse_atomics && opv == 0 && bytes >= 4) {
+        const IR::U64 operand = X(64, Rs);
+        ir.ClearExclusive();
+        const IR::U64 old = bytes == 8
+                               ? ir.AtomicAddMemory(address, operand)
+                               : ir.ZeroExtendToLong(ir.AtomicAddMemory(
+                                     address, ir.LeastSignificantWord(operand)));
+        X(64, Rt, old);
+        return true;
+    }
+#endif
     const IR::AccType acctype = AtomicAccType(A, R);
     const IR::U64 old = AtomicLoadZext(*this, address, bytes, acctype);
     const IR::U64 s = AtomicZeroExtendReg(*this, Rs, bytes);
@@ -137,6 +149,20 @@ bool TranslatorVisitor::LDAPR_sz(Imm<2> size, Reg Rn, Reg Rt) {
 bool TranslatorVisitor::CompareAndSwap(Imm<2> size, bool L, Reg Rs, bool o0, Reg Rn, Reg Rt) {
     const size_t bytes = size_t{1} << size.ZeroExtend<size_t>();
     const IR::U64 address = AtomicAddress(*this, Rn);
+#ifdef ARCHITECTURE_x86_64
+    if (options.native_lse_atomics && bytes >= 4) {
+        const IR::U64 expected = X(64, Rs);
+        const IR::U64 desired = X(64, Rt);
+        ir.ClearExclusive();
+        const IR::U64 old = bytes == 8
+                               ? ir.AtomicCasMemory(address, expected, desired)
+                               : ir.ZeroExtendToLong(ir.AtomicCasMemory(
+                                     address, ir.LeastSignificantWord(expected),
+                                     ir.LeastSignificantWord(desired)));
+        X(64, Rs, old);
+        return true;
+    }
+#endif
     const IR::AccType acctype = AtomicAccType(L, o0);
 
     const IR::U64 old = AtomicLoadZext(*this, address, bytes, acctype);

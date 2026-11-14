@@ -13,6 +13,7 @@ add_library(input_common STATIC
     drivers/mouse.h
     drivers/tas_input.cpp
     drivers/tas_input.h
+    drivers/tas_timing.h
     drivers/touch_screen.cpp
     drivers/touch_screen.h
     drivers/udp_client.cpp

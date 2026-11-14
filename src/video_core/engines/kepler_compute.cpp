@@ -27,6 +27,7 @@
 #include "video_core/front_qmd.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_semaphore_waiters.h"
 #include "video_core/nx2_drain_check.h"
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
@@ -1197,6 +1198,10 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     source.addr_lower = tonemapped.address_low;
     const s32 width = static_cast<s32>(output->Width());
     const s32 height = static_cast<s32>(output->Height());
+    static const bool transfer_copy = [] {
+        const char* value = std::getenv("EDEN_NX2_OOT_TRANSFER_COPY");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
     const Fermi2D::Config config{
         .operation = Fermi2D::Operation::SrcCopy,
         .filter = Fermi2D::Filter::Point,
@@ -1209,6 +1214,7 @@ bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
         .src_y0 = 0,
         .src_x1 = width,
         .src_y1 = height,
+        .prefer_transfer_copy = transfer_copy,
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(source, destination, config);
     bypass->output_replaced.store(copied, std::memory_order_relaxed);

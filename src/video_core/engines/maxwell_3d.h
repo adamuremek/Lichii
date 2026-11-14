@@ -69,6 +69,9 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    void SetDrawRegisterCoalescing(bool enabled);
+    [[nodiscard]] u64 ObserveFastDrawSerial();
+
     /// Register structure of the Maxwell3D engine.
     struct Regs {
         static constexpr std::size_t NUM_REGS = 0xE00;
@@ -2304,6 +2307,15 @@ public:
                 BitField<11, 3, GeometryClip> geometry_clip;
                 BitField<1, 2, GeometryGuardbandZ> geometry_guardband_z;
             };
+
+            static constexpr bool DepthClampDisabled(GeometryClip clip) {
+                return clip == GeometryClip::Passthrough || clip == GeometryClip::FrustumXYZ ||
+                       clip == GeometryClip::FrustumZ;
+            }
+
+            static constexpr bool DepthClampDisabled(u32 word) {
+                return DepthClampDisabled(decltype(geometry_clip)::ExtractValue(word));
+            }
         };
 
         enum class PrimitiveTopologyControl : u32 {
@@ -3275,7 +3287,7 @@ public:
     /// Fast draw (nx2_fast_draw.h): registers that only parameterize the next draw, the next
     /// constant buffer bind or the buffers a delta draw binds again, or that ProcessMethodCall
     /// handles, so writing them doesn't end draw reuse.
-    static bool IsFastDrawParameter(u32 method);
+    bool IsFastDrawParameter(u32 method, u32 previous, u32 next) const;
     /// Methods fast draw records as light changes (constant buffer data and binds).
     static bool IsFastDrawDeltaMethod(u32 method);
     /// A vertex stream's address, size or limit (not its stride or enable).
@@ -3324,15 +3336,23 @@ private:
             [[unlikely]] {
             draw_manager.DrawDeferred(*this, true);
         }
-        if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-            !IsFastDrawParameter(method)) {
-            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+        const u32 previous = regs.reg_array[method];
+        if (pending_draw_register_break == 0 && previous != argument &&
+            VideoCommon::Nx2FastDraw::Enabled() &&
+            !IsFastDrawParameter(method, previous, argument)) {
+            if (coalesce_draw_register_breaks) {
+                pending_draw_register_break = method + 1;
+            } else {
+                VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+            }
         }
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {
             dirty.flags[table[method]] = true;
         }
     }
+
+    friend class VideoCommon::GpuSplit;
 
     /// CallMethodFast for a state register (not in execution_mask): a write of the value the
     /// register holds changes nothing (EDEN_NX2_SKIP_SAME=0 keeps it).
@@ -3458,6 +3478,9 @@ private:
         return value == nullptr || value[0] != '0';
     }();
     const bool perf_verify = VideoCommon::Nx2Perf::Verify();
+    bool coalesce_draw_register_breaks{};
+    // First changed register since the last draw observed the serial, plus one.
+    u32 pending_draw_register_break{};
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
 

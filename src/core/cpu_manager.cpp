@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/core_pinning.h"
 #include "common/dkb_cpu_trace.h"
 #include "common/fiber.h"
 #include "common/scope_exit.h"
@@ -172,9 +173,9 @@ void CpuManager::ShutdownThread(Kernel::KernelCore& kernel) {
 
 void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     static_assert(Hardware::NUM_CPU_CORES == Common::DkbCpuTrace::GuestCoreCount);
-    const Common::DkbCpuTrace::Registration cpu_trace{
-        is_multicore ? static_cast<Common::DkbCpuTrace::Role>(core)
-                     : Common::DkbCpuTrace::Role::GuestSingleCore};
+    const auto role = is_multicore ? static_cast<Common::DkbCpuTrace::Role>(core)
+                                   : Common::DkbCpuTrace::Role::GuestSingleCore;
+    const Common::DkbCpuTrace::Registration cpu_trace{role};
     if (Kernel::GuestProfile::Enabled()) {
         Kernel::GuestProfile::SetCore(is_multicore ? static_cast<int>(core) : -1);
     }
@@ -184,9 +185,11 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
     Common::SetCurrentThreadName(name.c_str());
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
-    if (Settings::values.pin_gpu_threads.GetValue()) {
-        Common::PinCurrentThread(Common::PinnedRole::GuestCore);
+    const bool pin_gpu_threads = Settings::values.pin_gpu_threads.GetValue();
+    if (pin_gpu_threads) {
+        Common::PinCurrentGuestCore(core);
     }
+    const Common::CpuPlacementTrialThread placement{role, pin_gpu_threads};
     auto& data = core_data[core];
     data.host_context = Common::Fiber::ThreadToFiber();
 

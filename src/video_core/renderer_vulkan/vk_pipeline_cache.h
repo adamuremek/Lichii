@@ -37,11 +37,13 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
+#include "video_core/renderer_vulkan/vk_pipeline_vertex_types.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 #include "video_core/shader_cache_v2/cache.h"
 #include "video_core/shader_jobs.h"
 #include "video_core/shader_stage_translation.h"
+#include "video_core/stage_cache.h"
 
 namespace Core {
 class System;
@@ -133,6 +135,9 @@ public:
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
+    void NoteDynamicAttributeTypes(u64 types) noexcept {
+        graphics_key.state.attribute_types = types;
+    }
 
     void TickFrame();
 
@@ -278,6 +283,7 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
+    GraphicsPipeline* UseGraphicsPipeline(GraphicsPipeline& pipeline);
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
@@ -295,6 +301,8 @@ private:
     /// them (tick, pipeline)
     std::deque<std::pair<u64, std::unique_ptr<ComputePipeline>>> retired_compute_pipelines;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+    VertexTypePipelineIndex<GraphicsPipeline> vertex_type_pipelines;
+    u64 vertex_type_aliases{};
 
     ShaderPools main_pools;
     std::mutex spare_pools_mutex;
@@ -302,6 +310,7 @@ private:
 
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
+    VideoCommon::StageCache stage_cache;
 
     std::filesystem::path pipeline_cache_filename;
 

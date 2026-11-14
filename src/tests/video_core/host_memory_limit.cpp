@@ -50,6 +50,20 @@ TEST_CASE("The host memory bound does not wrap", "[video_core][texture_cache][ho
     REQUIRE(VideoCommon::HostCriticalMemory(max, max) == max - VideoCommon::HostCommitReserve);
 }
 
+TEST_CASE("The recycler retains images within physical headroom and trims the actual excess",
+          "[video_core][texture_cache][host_memory_limit]") {
+    using VideoCommon::RecycledImageBytesToKeep;
+    constexpr u64 kept = 512 * MiB;
+    constexpr u64 usage = 10190 * MiB;
+    constexpr u64 limit = 12856 * MiB;
+    CHECK(RecycledImageBytesToKeep(usage, kept, limit) == kept);
+    CHECK(RecycledImageBytesToKeep(limit, kept, limit) == kept);
+    CHECK(RecycledImageBytesToKeep(limit + 80 * MiB, kept, limit) == 432 * MiB);
+    CHECK(RecycledImageBytesToKeep(limit + kept, kept, limit) == 0);
+    CHECK(RecycledImageBytesToKeep(usage, kept, VideoCommon::HostCriticalMemory(usage, GiB)) == 0);
+    CHECK(RecycledImageBytesToKeep(usage, 0, 0) == 0);
+}
+
 TEST_CASE("The system's commit room is reported where there is a commit limit",
           "[video_core][texture_cache][host_memory_limit]") {
     const std::optional<u64> room = Common::GetSystemCommitRoom();

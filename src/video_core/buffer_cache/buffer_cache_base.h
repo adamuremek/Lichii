@@ -287,6 +287,14 @@ public:
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
+    [[nodiscard]] bool HasHotUploadPages() const noexcept {
+        return !hot_upload_pages.empty();
+    }
+
+    [[nodiscard]] bool IsHotUploadRange(DAddr device_addr, u64 size) {
+        return memory_tracker.IsRegionHot(device_addr, size);
+    }
+
     void DownloadMemory(DAddr device_addr, u64 size);
 
     /// DownloadMemory for a guest CPU read: submits the copies without waiting for the host GPU,
@@ -374,10 +382,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
-    /// write_extent: how far the program's stores reach past the pointer (native programs).
+    /// access_extent bounds stores for written bindings and loads for read-only native bindings.
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U,
-                                  const Shader::StorageWriteExtent& write_extent = {});
+                                  const Shader::StorageAccessExtent& access_extent = {});
 
     void UnbindComputeTextureBuffers();
 
@@ -543,7 +551,7 @@ public:
     /// Called before each graphics draw binds its buffers (uniform keeps). `delta`: the constant
     /// buffer binds and data since the previous draw when it is a fast draw delta draw, else
     /// nullptr.
-    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta);
+    void BeginGraphicsUniforms(const Nx2FastDraw::Delta* delta, bool full_draw = false);
 
     /// Index and vertex stream ranges the back split's pool resolved for the current draw, or
     /// nullptr (EDEN_NX2_BACK_SPLIT): UpdateGraphicsBuffers takes them instead of its own.
@@ -590,7 +598,8 @@ private:
                ((device_addr + size) & ~Core::DEVICE_PAGEMASK);
     }
 
-    void RunGarbageCollector(bool aggressive_gc);
+    void RunGarbageCollector(bool aggressive_gc, BufferId retained_buffer = {});
+    void CollectNativeBuffers();
 
     void BindHostIndexBuffer();
 
@@ -672,10 +681,16 @@ private:
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
-    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size,
+                           bool learn_hot_pages = true);
 
     /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
     void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
+
+    struct BufferSyncStats;
+    void SynchronizeTrackedBuffer(u32 slot, Buffer& buffer, BufferId buffer_id, DAddr device_addr,
+                                  u32 size, BufferSyncStats& stats, bool verify);
+    void SynchronizeGraphicsStorageBuffer(Buffer& buffer, const Binding& binding, bool is_written);
 
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
@@ -693,6 +708,14 @@ private:
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
 
     void DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges);
+
+    struct StagedReadbackCopy {
+        BufferId buffer_id;
+        BufferCopy copy;
+    };
+    void RecordStagedReadbackCopies(const Async_Buffer& staging,
+                                    std::span<StagedReadbackCopy> copies,
+                                    bool group_barriers = false);
 
     /// ClearDownload, for the downloads taken at fences only.
     void ClearFenceDownloads(DAddr device_addr, u64 size);
@@ -734,7 +757,8 @@ private:
     [[nodiscard]] Binding StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                                bool native_pointer = false,
                                                bool table_pointer = false,
-                                               bool compute = false) const;
+                                               bool compute = false,
+                                               u32 max_read_bytes = 0) const;
 
     void TraceTablePointer(bool compute, size_t stage, size_t ssbo_index, u32 cbuf_index,
                            u32 cbuf_offset, u32 indirect_offset, GPUVAddr holder,
@@ -762,6 +786,13 @@ private:
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
 
+    void LearnHotUploadPages(DAddr device_addr, u64 size);
+    void PromoteHotUploadPages();
+    bool SynchronizeHotUploadPages(Buffer& buffer, DAddr device_addr, u32 size);
+    bool DemoteHotUploadPages(DAddr device_addr, u64 size);
+    void DemoteHotUploadPage(DAddr page);
+    [[nodiscard]] bool CanKeepUploadPageHot(DAddr page) const;
+
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
@@ -784,14 +815,18 @@ private:
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
 
-    /// The range each geometry slot last scanned for uploads (SynchronizeGeometryBuffer).
-    struct GeometrySync {
+    /// The range each slot last scanned for uploads.
+    struct BufferSync {
         BufferId buffer_id{};
         DAddr device_addr{};
         u32 size{};
         u64 deletions{};
     };
-    std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    static constexpr u32 FIRST_STORAGE_SYNC_SLOT = NUM_VERTEX_BUFFERS + 1;
+    static constexpr u32 NUM_STORAGE_SYNC_SLOTS = 16;
+    static_assert(FIRST_STORAGE_SYNC_SLOT + NUM_STORAGE_SYNC_SLOTS <=
+                  MemoryTracker::NUM_SYNCHRONIZED_SLOTS);
+    std::array<BufferSync, FIRST_STORAGE_SYNC_SLOT + NUM_STORAGE_SYNC_SLOTS> buffer_syncs{};
     PreparedGeometry* prepared_geometry{};
     /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
     u64 buffer_deletions = 0;
@@ -809,17 +844,25 @@ private:
         BufferId buffer_id{};
     };
     IndexBufferMemo index_buffer_memo;
-    struct GeometryStats {
+    struct BufferSyncStats {
         u64 syncs{};
         u64 syncs_skipped{};
         u64 verify_mismatches{};
-    } geometry_stats;
+    } geometry_stats, storage_sync_stats;
+    bool reuse_storage_scans = [] {
+        const char* const value = std::getenv("EDEN_NX2_REUSE_STORAGE_SCANS");
+        return value && value[0] == '1';
+    }();
+    const bool verify_storage_scans = [] {
+        const char* const value = std::getenv("EDEN_NX2_REUSE_STORAGE_SCANS_VERIFY");
+        return value && value[0] == '1';
+    }();
 
-    /// Uniform keeps: a delta draw binds a small uniform buffer from the stream
+    /// Uniform keeps: a draw binds a small uniform buffer from the stream
     /// allocation the previous draw made for it, without reading guest memory, when nothing ordered
     /// between the two draws wrote its range: no inline constant data, no rebind, no CPU write the
     /// caches were told about, no GPU write and no buffer deletion. Anything else in between ends
-    /// the delta chain.
+    /// the reuse chain.
     [[nodiscard]] bool UniformRangeKept(size_t stage, u32 index, DAddr device_addr,
                                         u32 size) const noexcept;
     void NoteUniformWrite(DAddr device_addr, u64 size) {
@@ -845,14 +888,40 @@ private:
             writes;
         boost::container::static_vector<std::pair<DAddr, DAddr>, 8> memory_writes;
         bool memory_writes_lost{}; ///< More writes than memory_writes holds
+        bool full_draw{}; ///< Reuse is only allowed on the current draw's stream path
         u64 draw_deletions{}; ///< buffer_deletions when the previous draw began
         u64 kept{};
+        u64 kept_full{};
         u64 streamed_binds{};
         u64 verified{};
         u64 mismatches{};
     } uniform_keep;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
+
+    const bool hot_uploads_enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_HOT_UPLOAD_PAGES");
+        return !IS_OPENGL && USE_MEMORY_MAPS_FOR_UPLOADS && value && value[0] == '1';
+    }();
+    struct HotUploadPage {
+        std::array<u8, Core::DEVICE_PAGESIZE> bytes{};
+        u64 changed_frame{};
+        u32 unchanged_checks{};
+        bool valid{};
+    };
+    struct UploadPageHeat {
+        u64 frame{};
+        u32 uploads{};
+    };
+    static constexpr size_t MAX_HOT_UPLOAD_PAGES = 2048;
+    Common::unordered_map<DAddr, std::unique_ptr<HotUploadPage>> hot_upload_pages;
+    Common::unordered_map<DAddr, UploadPageHeat> upload_page_heat;
+    Common::RangeSet<DAddr> hot_upload_query_ranges;
+    boost::container::small_vector<DAddr, 8> hot_upload_promotions;
+    u64 hot_upload_checks{};
+    u64 hot_upload_changes{};
+    u64 hot_upload_promoted{};
+    u64 hot_upload_demoted{};
 
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
@@ -1216,6 +1285,9 @@ private:
     std::unordered_map<u64, std::pair<GPUVAddr, u32>> traced_table_pointers;
     u64 total_used_memory = 0;
     u64 buffer_bytes = 0; ///< The buffers' own size (total_used_memory may be the device's)
+    BufferId large_buffer_candidate{};
+    u64 large_buffer_headroom_check_frame = 0;
+    u64 large_buffer_retention_limit = 0;
     u64 minimum_memory = 0;
     u64 critical_memory = 0;
     BufferId inline_buffer_id;

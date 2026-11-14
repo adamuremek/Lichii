@@ -94,6 +94,36 @@ TEST_CASE("ShaderPrecache: the marker matches only the same file and driver", "[
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
 }
 
+TEST_CASE("ShaderPrecache: the marker records its version", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache");
+
+    auto stamp = ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53);
+    REQUIRE(stamp.has_value());
+    REQUIRE(stamp->marker_version == ShaderWarm::WarmMarkerVersion);
+    REQUIRE(ShaderWarm::WriteWarmMarker(warm, *stamp));
+    const auto marker = ShaderWarm::ReadWarmMarker(warm);
+    REQUIRE(marker.has_value());
+    REQUIRE(marker->marker_version == ShaderWarm::WarmMarkerVersion);
+    REQUIRE(marker->Matches(*stamp));
+
+    // A marker of another version does not match, including the calls modes (0 to 3) that
+    // test builds stored in this field.
+    stamp->marker_version = ShaderWarm::WarmMarkerVersion - 1;
+    REQUIRE_FALSE(marker->Matches(*stamp));
+    for (u32 old_mode = 0; old_mode <= 3; ++old_mode) {
+        auto old_stamp = *marker;
+        old_stamp.marker_version = old_mode;
+        REQUIRE_FALSE(old_stamp.Matches(*marker));
+    }
+
+    // A marker from before the version was recorded (six fields) no longer reads, so the
+    // precache runs once more.
+    WriteBytes(ShaderWarm::WarmMarkerPath(warm), "8 1 12 4660 8710 53\n");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+}
+
 TEST_CASE("ShaderPrecache: precached pipelines are kept per driver", "[video_core]") {
     TempDir dir;
     const auto file = dir.path / "precache-graphics.bin";

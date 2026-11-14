@@ -32,6 +32,17 @@ struct RenderTargets {
     bool is_rescaled{};
 };
 
+struct RenderTargetPreparationKey {
+    constexpr bool operator==(const RenderTargetPreparationKey&) const noexcept = default;
+
+    const void* address_space{};
+    size_t channel{};
+    u64 targets{};
+    u64 frame{};
+    u64 modification{};
+    u64 mapping{};
+};
+
 } // namespace VideoCommon
 
 namespace std {

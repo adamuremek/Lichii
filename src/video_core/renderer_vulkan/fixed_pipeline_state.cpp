@@ -13,7 +13,9 @@
 #include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/settings.h"
+#include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -122,6 +124,71 @@ u64 FixedPipelineState::DynamicAttributeTypes(const Maxwell& regs) noexcept {
         types |= static_cast<u64>(type & mask) << (i * 2);
     }
     return types;
+}
+
+u64 FixedPipelineState::UsedAttributeTypeMask(const Shader::Info& vertex) noexcept {
+    if (vertex.loads_indexed_attributes || vertex.loads.Legacy() || vertex.passthrough.Legacy()) {
+        return ~u64{0};
+    }
+    static_assert(Maxwell::NumVertexAttributes == Shader::IR::NUM_GENERICS);
+    u64 mask = 0;
+    for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+        if (vertex.loads.Generic(index) || vertex.passthrough.Generic(index)) {
+            mask |= u64{3} << (2 * index);
+        }
+    }
+    return mask;
+}
+
+bool FixedPipelineState::MatchesWithAttributeTypeMask(const FixedPipelineState& rhs,
+                                                      u64 mask) const noexcept {
+    if (!dynamic_vertex_input || !rhs.dynamic_vertex_input ||
+        ((attribute_types ^ rhs.attribute_types) & mask) != 0) {
+        return false;
+    }
+    constexpr size_t before_types = offsetof(FixedPipelineState, attribute_types);
+    constexpr size_t after_types = before_types + sizeof(attribute_types);
+    const auto* lhs_bytes = reinterpret_cast<const char*>(this);
+    const auto* rhs_bytes = reinterpret_cast<const char*>(&rhs);
+    if (std::memcmp(lhs_bytes, rhs_bytes, before_types) != 0) {
+        return false;
+    }
+    if (std::memcmp(lhs_bytes + after_types, rhs_bytes + after_types, Size() - after_types) == 0) {
+        return true;
+    }
+    if (!VideoCommon::Nx2FastDraw::g_raster_state_reuse.enabled) {
+        return false;
+    }
+    // The current draw can change unread vertex types and unused attachment state together.
+    auto normalized = rhs;
+    normalized.attribute_types = attribute_types;
+    return MatchesWithoutTrailingBlend(normalized);
+}
+
+size_t FixedPipelineState::ColorAttachmentCount() const noexcept {
+    for (size_t count = color_formats.size(); count != 0; --count) {
+        if (color_formats[count - 1] != static_cast<u8>(Tegra::RenderTargetFormat::NONE)) {
+            return count;
+        }
+    }
+    return 0;
+}
+
+bool FixedPipelineState::MatchesWithoutTrailingBlend(const FixedPipelineState& rhs) const noexcept {
+    constexpr size_t start = offsetof(FixedPipelineState, attachments);
+    constexpr size_t end = start + sizeof(attachments);
+    const size_t size = Size();
+    if (size < end || size != rhs.Size()) {
+        return false;
+    }
+    const size_t count = ColorAttachmentCount();
+    if (count == attachments.size()) {
+        return false;
+    }
+    const auto* lhs_bytes = reinterpret_cast<const char*>(this);
+    const auto* rhs_bytes = reinterpret_cast<const char*>(&rhs);
+    return std::memcmp(lhs_bytes, rhs_bytes, start + count * sizeof(BlendingAttachment)) == 0 &&
+           std::memcmp(lhs_bytes + end, rhs_bytes + end, size - end) == 0;
 }
 
 void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
@@ -399,12 +466,8 @@ void FixedPipelineState::DynamicState::Refresh3(const Maxwell& regs,
         logic_op_enable.Assign(regs.logic_op.enable != 0 ? 1 : 0);
     }
     if (!features.has_dynamic_state3_depth_clamp_enable) {
-        depth_clamp_disabled.Assign(regs.viewport_clip_control.geometry_clip ==
-                                        Maxwell::ViewportClipControl::GeometryClip::Passthrough ||
-                                    regs.viewport_clip_control.geometry_clip ==
-                                        Maxwell::ViewportClipControl::GeometryClip::FrustumXYZ ||
-                                    regs.viewport_clip_control.geometry_clip ==
-                                        Maxwell::ViewportClipControl::GeometryClip::FrustumZ);
+        depth_clamp_disabled.Assign(Maxwell::ViewportClipControl::DepthClampDisabled(
+            regs.viewport_clip_control.geometry_clip.Value()));
     }
     if (!features.has_dynamic_state3_line_stipple_enable) {
         line_stipple_enable.Assign(regs.line_stipple_enable);

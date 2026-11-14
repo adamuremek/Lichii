@@ -29,6 +29,7 @@ class MemoryManager;
 
 namespace Tegra::Engines {
 class EngineInterface;
+class Maxwell3D;
 enum class EngineTypes : u32;
 }
 
@@ -144,6 +145,13 @@ public:
     /// Any thread: whether the back thread runs (false before it starts and once it stopped).
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
+    }
+
+    /// A scheduling hint for the back thread, including a front wait that is still spinning.
+    [[nodiscard]] bool FrontWaitsForBack() const noexcept {
+        return wait_target.load(std::memory_order_relaxed) != ~u64{0} ||
+               hook_requested.load(std::memory_order_relaxed) ||
+               front_waiting.load(std::memory_order_relaxed);
     }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
@@ -642,7 +650,10 @@ private:
 
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
-    size_t Execute(const u64* entry, size_t words);
+    size_t Execute(const u64* entry, size_t words, u64 publish_boundary = ~u64{0});
+    static bool IsStateWrite(const Tegra::Engines::Maxwell3D& engine, u64 word);
+    size_t ExecuteStateRun(Tegra::Engines::Maxwell3D& engine, const u64* entry, size_t words,
+                           u64 publish_boundary);
     /// The back, between entries: runs the tick hook if a thread asked for it.
     void MaybeTick() {
         if (tick_requested.load(std::memory_order_relaxed) &&
@@ -658,8 +669,8 @@ private:
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Front and back write separate 128-byte blocks to avoid false sharing.
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 synced_writer_position{};
@@ -702,8 +713,9 @@ private:
     Tegra::Engines::EngineInterface* front_engine{};
 
     // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
     u64 back_entry_start{}; ///< Where the entry the back runs starts (BackEntry)
+    bool batch_state_writes{};
 
     /// An entry's position as fenced writes name it: with this start of the split in the high
     /// bits, so a fence of an earlier start that runs late lands nothing of this one (positions

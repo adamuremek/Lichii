@@ -4,10 +4,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "common/common_types.h"
+#include "input_common/drivers/tas_timing.h"
 #include "input_common/input_engine.h"
 
 /*
@@ -85,6 +89,9 @@ public:
     explicit Tas(std::string input_engine_);
     ~Tas() override;
 
+    [[nodiscard]] bool IsEnabled() const;
+    [[nodiscard]] bool HasRouteRecordingFile() const;
+
     /**
      * Changes the input status that will be stored in each frame
      * @param buttons    Bitfield with the status of the buttons
@@ -141,15 +148,15 @@ private:
     /**
      * Loads TAS file from the specified player
      * @param player_index Player number to save the script
-     * @param file_index   Script number of the file
+     * @param path        Script path
      */
-    void LoadTasFile(size_t player_index, size_t file_index);
+    u64 LoadTasFile(size_t player_index, const std::filesystem::path& path);
 
     /**
      * Writes a TAS file from the recorded commands
-     * @param file_name Name of the file to be written
+     * @param path Path of the file to be written
      */
-    void WriteTasFile(std::u8string_view file_name);
+    bool WriteTasFile(const std::filesystem::path& path);
 
     /**
      * Parses a string containing the axis values. X and Y have a range from -32767 to 32767
@@ -170,6 +177,7 @@ private:
      * Reset state of all players
      */
     void ClearInput();
+    void ApplyCommand(size_t player_index, const TASCommand& command);
 
     /**
      * Converts an u64 containing the button status into the text equivalent
@@ -187,12 +195,22 @@ private:
 
     /// Sets an axis for a particular pad to the given value.
     void SetTasAxis(const PadIdentifier& identifier, TasAxis axis, f32 value);
+    void RecordPlaybackFrame();
 
     size_t script_length{0};
-    bool is_recording{false};
+    u64 route_hash{};
+    const size_t idle_benchmark_frames;
+    const GpuBenchmark::Experiment benchmark_experiment;
+    const std::filesystem::path route_file;
+    const std::filesystem::path recording_file;
+    PlaybackTiming playback_timing;
+    GpuBenchmark gpu_benchmark;
+    u64 last_benchmark_frame{};
+    std::atomic<bool> is_recording{};
     bool is_running{false};
     bool needs_reset{false};
     std::array<std::vector<TASCommand>, PLAYER_NUMBER> commands{};
+    mutable std::mutex recording_mutex;
     std::vector<TASCommand> record_commands{};
     size_t current_command{0};
     TASCommand last_input{}; // only used for recording

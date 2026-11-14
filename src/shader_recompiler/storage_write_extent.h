@@ -12,20 +12,18 @@
 
 namespace Shader {
 
-/// How far a program's stores and atomics to one storage buffer can reach, in bytes past the
-/// pointer it reads from its constant buffer. Every store ends at or below
+/// How far a program's accesses to one storage buffer can reach, in bytes past the pointer it
+/// reads from its constant buffer. Every covered access ends at or below
 ///
 ///   const_end + sum(local_stride[i] * local_id[i]) + sum(group_stride[i] * group_id[i])
 ///
 /// for every invocation, where local_id is gl_LocalInvocationID and group_id gl_WorkGroupID. The
-/// bound only holds while each value the stores' offsets split into 16-bit halves (multiplications
+/// bound only holds while each value the offsets split into 16-bit halves (multiplications
 /// lowered from native IMAD) stays below 2^16: guard_* is an upper bound of the largest of them in
 /// the same form, and the extent is unknown when it can reach 2^16 for a dispatch.
 ///
-/// A native (Switch 2) program's storage pointer carries no size, so the buffer cache binds up to
-/// 8 MiB behind it; this is what it can claim the dispatch wrote instead of all of it.
-struct StorageWriteExtent {
-    /// False: the reach is not known (or the buffer is never written); take the whole binding.
+struct StorageAccessExtent {
+    /// False: the reach is unknown. Use the full binding.
     bool bounded{};
     /// Whether the bound needs the guard below.
     bool guarded{};
@@ -36,13 +34,13 @@ struct StorageWriteExtent {
     std::array<u32, 3> guard_local_stride{};
     std::array<u32, 3> guard_group_stride{};
 
-    auto operator<=>(const StorageWriteExtent&) const = default;
+    auto operator<=>(const StorageAccessExtent&) const = default;
 };
 
-/// Bytes a dispatch's stores can reach past the pointer, or nullopt when unknown. grid is nullopt
+/// Bytes a dispatch's accesses can reach past the pointer, or nullopt when unknown. grid is nullopt
 /// for an indirect dispatch, whose group count is read by the GPU.
-[[nodiscard]] constexpr std::optional<u64> ResolveStorageWriteExtent(
-    const StorageWriteExtent& extent, const std::array<u32, 3>& block,
+[[nodiscard]] constexpr std::optional<u64> ResolveStorageAccessExtent(
+    const StorageAccessExtent& extent, const std::array<u32, 3>& block,
     const std::optional<std::array<u32, 3>>& grid) {
     if (!extent.bounded) {
         return std::nullopt;
@@ -93,9 +91,9 @@ struct StorageWriteExtent {
 }
 
 /// Widens an extent to also cover another (both bounds hold for each component's maximum).
-constexpr void MergeStorageWriteExtent(StorageWriteExtent& base, const StorageWriteExtent& other) {
+constexpr void MergeStorageAccessExtent(StorageAccessExtent& base, const StorageAccessExtent& other) {
     if (!base.bounded || !other.bounded) {
-        base = StorageWriteExtent{};
+        base = StorageAccessExtent{};
         return;
     }
     const auto max3 = [](std::array<u32, 3>& lhs, const std::array<u32, 3>& rhs) {

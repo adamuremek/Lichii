@@ -4,10 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <utility>
@@ -114,6 +116,15 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
+        static const bool skip_empty = [] {
+            const char* value = std::getenv("EDEN_NX2_FAST_DIRTY_GATHER");
+            return value && value[0] == '1' && value[1] == '\0';
+        }();
+        if (skip_empty &&
+            std::ranges::none_of(system.GetGPUDirtyMemoryManager(),
+                                 &Core::GPUDirtyMemoryManager::HasCollectedWrites)) {
+            return;
+        }
         std::vector<std::pair<DAddr, u64>> writes;
         {
             // Gathered writes stay pending (ForEachPendingCpuWrite) until they are applied: a
@@ -122,7 +133,7 @@ struct GPU::Impl {
             std::scoped_lock lock{applying_writes_mutex};
             std::function<void(PAddr, size_t)> callback_writes(
                 [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
-            system.GatherGPUDirtyMemory(callback_writes);
+            system.GatherGPUDirtyMemory(callback_writes, skip_empty);
             if (writes.empty()) {
                 return;
             }

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,8 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/logging.h"
+#include "common/memory_detect.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -47,6 +50,11 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 // against the end of the buffer ("argument c3[0] ... has space for 26624 bytes, but argument has a
 // length(65536)"). The tail is never handed out, so every binding has the full 64 KiB behind it.
 constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
+
+bool WarmUploadArenaRequested() {
+    const char* value = std::getenv("EDEN_NX2_WARM_UPLOAD_ARENA");
+    return value && std::string_view{value} == "1";
+}
 
 size_t GetStreamBufferSize(const Device& device) {
     if (!device.HasDebuggingToolAttached()) {
@@ -90,6 +98,16 @@ size_t GetStreamBufferSize(const Device& device) {
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
                                      Scheduler& scheduler_)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
+      reuse_staging{[] {
+          const char* value = std::getenv("EDEN_NX2_STAGING_REUSE");
+          return value && std::string_view{value} == "1";
+      }()},
+      upload_arena_enabled{[] {
+          const char* value = std::getenv("EDEN_NX2_UPLOAD_ARENA");
+          return WarmUploadArenaRequested() || (value && std::string_view{value} == "1");
+      }()},
+      upload_arena_alignment{3 * (std::max)({MAX_ALIGNMENT, device.GetStorageBufferAlignment(),
+                                             device.GetUniformBufferAlignment()})},
       stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
                                                                    StagingBufferPool::NUM_SYNCS} {
     VkBufferCreateInfo stream_ci = {
@@ -121,6 +139,20 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     }
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
+
+    if (WarmUploadArenaRequested() && !device.IsIntegrated() &&
+        Common::GetMemInfo().TotalPhysicalMemory >= 16_GiB) {
+        // Allocate on startup so a scene transition can reuse mapped host buffers.
+        for (size_t i = 0; i < StagingBufferPolicy::UploadArenaBlockCount; ++i) {
+            constexpr size_t capacity = StagingBufferPolicy::WarmUploadArenaBlockSize;
+            const auto commit_room = Common::GetSystemCommitRoom();
+            if ((commit_room && *commit_room < 2_GiB + capacity) || !AddUploadArenaBlock(capacity)) {
+                break;
+            }
+        }
+        LOG_INFO(Render_Vulkan, "Upload arena reserved {} MiB at startup",
+                 CachedBytes(MemoryUsage::Upload) >> 20);
+    }
 }
 
 StagingBufferPool::~StagingBufferPool() = default;
@@ -132,8 +164,57 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
     return GetStagingBuffer(size, usage, deferred);
 }
 
+LargeUploadStaging StagingBufferPool::TryLargeUpload(size_t size) {
+    namespace Policy = StagingBufferPolicy;
+    if (size <= Policy::WarmUploadArenaBlockSize || upload_arena.empty()) {
+        return {};
+    }
+
+    auto& semaphore = scheduler.GetMasterSemaphore();
+    semaphore.Refresh();
+    const u32 size_class = Policy::SizeClass(size, reuse_staging);
+    const u32 last_class = Policy::LastReuseClass(size_class, reuse_staging);
+    for (u32 candidate = size_class; candidate <= last_class; ++candidate) {
+        if (auto ref = TryGetReservedBuffer(candidate, MemoryUsage::Upload, false)) {
+            ref->mapped_span = ref->mapped_span.first(size);
+            return {*ref};
+        }
+    }
+
+    boost::container::static_vector<Policy::UploadArenaReservation, Policy::UploadArenaBlockCount>
+        reservations;
+    for (const auto& block : upload_arena) {
+        reservations.push_back({block.cursor, block.buffer.Mapped().size()});
+    }
+    const size_t remaining =
+        Policy::PlanLargeUpload(std::span{reservations.data(), reservations.size()}, size,
+                                upload_arena_alignment, scheduler.CurrentTick(),
+                                semaphore.KnownGpuTick(), reuse_staging);
+    if (remaining == size) {
+        return {};
+    }
+
+    LargeUploadStaging slices;
+    for (size_t i = 0; i < reservations.size(); ++i) {
+        const auto& reservation = reservations[i];
+        if (reservation.size != 0) {
+            auto& block = upload_arena[i];
+            block.cursor = reservation.cursor;
+            slices.push_back(block.Slice(reservation.offset, reservation.size));
+        }
+    }
+    if (remaining != 0) {
+        auto spill = GetStagingBuffer(remaining, MemoryUsage::Upload);
+        spill.mapped_span = spill.mapped_span.first(remaining);
+        slices.push_back(spill);
+    }
+    LOG_INFO(Render_Vulkan, "Large buffer upload: {} MiB from arena, {} MiB from staging",
+             (size - remaining) / 1_MiB, remaining / 1_MiB);
+    return slices;
+}
+
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
-    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+    auto& entries = GetCache(ref.usage)[ref.size_class].entries;
     const auto is_this_one = [&ref](const StagingBuffer& entry) {
         return entry.index == ref.index;
     };
@@ -141,11 +222,20 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     ASSERT(it != entries.end());
     ASSERT(it->deferred);
     it->tick = scheduler.CurrentTick();
+    it->last_use_frame = frame;
     it->deferred = false;
 }
 
 void StagingBufferPool::TickFrame() {
-    current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+    if (reuse_staging) {
+        ++frame;
+        size_t deletions_left = StagingBufferPolicy::DeletionsPerFrame;
+        ReleaseInactive(upload_cache, deletions_left);
+        ReleaseInactive(download_cache, deletions_left);
+        ReleaseInactive(device_local_cache, deletions_left);
+        return;
+    }
+    current_delete_level = (current_delete_level + 1) % StagingBufferPolicy::SizeBits;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
@@ -184,7 +274,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
         .offset = static_cast<VkDeviceSize>(offset),
         .mapped_span = stream_pointer.subspan(offset, size),
         .usage{},
-        .log2_level{},
+        .size_class{},
         .index{},
     };
 }
@@ -197,16 +287,85 @@ bool StagingBufferPool::AreRegionsActive(size_t region_begin, size_t region_end)
 
 StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage usage,
                                                      bool deferred) {
-    if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
-        return *ref;
+    const u32 size_class = StagingBufferPolicy::SizeClass(size, reuse_staging);
+    const u32 last_class = StagingBufferPolicy::LastReuseClass(size_class, reuse_staging);
+    for (u32 candidate = size_class; candidate <= last_class; ++candidate) {
+        if (const auto ref = TryGetReservedBuffer(candidate, usage, deferred)) {
+            return *ref;
+        }
     }
-    return CreateStagingBuffer(size, usage, deferred);
+    if (upload_arena_enabled && usage == MemoryUsage::Upload && !deferred && size != 0 &&
+        size <= StagingBufferPolicy::WarmUploadArenaBlockSize) {
+        if (const auto ref = TryGetUploadSlice(size)) {
+            return *ref;
+        }
+    }
+    return CreateStagingBuffer(size_class, usage, deferred);
 }
 
-std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t size,
+std::optional<StagingBufferRef> StagingBufferPool::TryGetUploadSlice(size_t size) {
+    const u64 tick = scheduler.CurrentTick();
+    const u64 completed_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    const auto reserve = [&](UploadArenaBlock& block) -> std::optional<StagingBufferRef> {
+        const auto mapped = block.buffer.Mapped();
+        const auto offset = block.cursor.TryReserve(size, upload_arena_alignment, mapped.size(),
+                                                    tick, completed_tick);
+        if (!offset) {
+            return std::nullopt;
+        }
+        return block.Slice(*offset, size);
+    };
+    for (auto& block : upload_arena) {
+        if (const auto ref = reserve(block)) {
+            return ref;
+        }
+    }
+    if (size > StagingBufferPolicy::UploadArenaBlockSize ||
+        !AddUploadArenaBlock(StagingBufferPolicy::UploadArenaBlockSize)) {
+        return std::nullopt;
+    }
+    return reserve(upload_arena.back());
+}
+
+bool StagingBufferPool::AddUploadArenaBlock(size_t capacity) {
+    if (!upload_arena_can_grow || upload_arena.size() == StagingBufferPolicy::UploadArenaBlockCount) {
+        return false;
+    }
+    vk::Buffer buffer;
+    try {
+        buffer = CreateBuffer(capacity, MemoryUsage::Upload);
+    } catch (const vk::Exception& error) {
+        if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw;
+        }
+        upload_arena_can_grow = false;
+        return false;
+    }
+    if (!buffer.IsHostCoherent() || buffer.Mapped().empty()) {
+        upload_arena_can_grow = false;
+        return false;
+    }
+    if (capacity > StagingBufferPolicy::UploadArenaBlockSize) {
+        const auto properties = device.GetPhysical().GetMemoryProperties().memoryProperties;
+        const u32 heap = properties.memoryTypes[buffer.Location().memory_type].heapIndex;
+        if (properties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            return false;
+        }
+    }
+    const VkDeviceAddress device_address = GetBufferAddress(*buffer);
+    upload_arena.push_back(UploadArenaBlock{
+        .buffer = std::move(buffer),
+        .device_address = device_address,
+        .cursor{},
+    });
+    return true;
+}
+
+std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(u32 size_class,
                                                                         MemoryUsage usage,
                                                                         bool deferred) {
-    StagingBuffers& cache_level = GetCache(usage)[Common::Log2Ceil(size)];
+    StagingBuffers& cache_level = GetCache(usage)[size_class];
 
     const auto is_free = [this](const StagingBuffer& entry) {
         return !entry.deferred && scheduler.IsFree(entry.tick);
@@ -222,19 +381,19 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     }
     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
     it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
+    it->last_use_frame = frame;
     ASSERT(!it->deferred);
     it->deferred = deferred;
     return it->Ref();
 }
 
-StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
+vk::Buffer StagingBufferPool::CreateBuffer(VkDeviceSize size, MemoryUsage usage) {
     const VideoCommon::StutterTrace::SiteScope site{VideoCommon::StutterTrace::Site::StagingCreate};
-    auto const log2_size = Common::Log2Ceil<u32>(u32(size));
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = 1ULL << log2_size,
+        .size = size,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
@@ -254,19 +413,29 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         ++buffer_index;
         buffer.SetObjectNameEXT(fmt::format("Staging Buffer {}", buffer_index).c_str());
     }
+    return buffer;
+}
+
+VkDeviceAddress StagingBufferPool::GetBufferAddress(VkBuffer buffer) const {
+    return device.IsBufferDeviceAddressSupported()
+               ? device.GetLogical().GetBufferDeviceAddress(buffer)
+               : VkDeviceAddress{};
+}
+
+StagingBufferRef StagingBufferPool::CreateStagingBuffer(u32 size_class, MemoryUsage usage,
+                                                       bool deferred) {
+    vk::Buffer buffer = CreateBuffer(StagingBufferPolicy::ClassSize(size_class, reuse_staging), usage);
     const std::span<u8> mapped_span = buffer.Mapped();
-    const VkDeviceAddress buffer_address =
-        device.IsBufferDeviceAddressSupported()
-            ? device.GetLogical().GetBufferDeviceAddress(*buffer)
-            : VkDeviceAddress{};
-    StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
+    const VkDeviceAddress buffer_address = GetBufferAddress(*buffer);
+    StagingBuffer& entry = GetCache(usage)[size_class].entries.emplace_back(StagingBuffer{
         .buffer = std::move(buffer),
         .device_address = buffer_address,
         .mapped_span = mapped_span,
         .usage = usage,
-        .log2_level = log2_size,
+        .size_class = size_class,
         .index = unique_ids++,
         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
+        .last_use_frame = frame,
         .deferred = deferred,
     });
     return entry.Ref();
@@ -287,11 +456,18 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage 
 }
 
 u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
-    u64 bytes{};
+    u64 bytes = 0;
+    if (usage == MemoryUsage::Upload) {
+        for (const auto& block : upload_arena) {
+            bytes += block.buffer.Mapped().size();
+        }
+    }
     const StagingBuffersCache& cache = GetCache(usage);
-    for (size_t level = 0; level < NUM_LEVELS; ++level) {
+    const u32 level_count = reuse_staging ? StagingBufferPolicy::NumClasses
+                                         : StagingBufferPolicy::SizeBits + 1;
+    for (u32 level = 0; level < level_count; ++level) {
         if (!cache[level].entries.empty()) {
-            bytes += u64{cache[level].entries.size()} << level;
+            bytes += cache[level].entries.size() * StagingBufferPolicy::ClassSize(level, reuse_staging);
         }
     }
     return bytes;
@@ -299,6 +475,25 @@ u64 StagingBufferPool::CachedBytes(MemoryUsage usage) {
 
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
     ReleaseLevel(GetCache(usage), current_delete_level);
+}
+
+void StagingBufferPool::ReleaseInactive(StagingBuffersCache& cache, size_t& deletions_left) {
+    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    for (auto level = cache.rbegin(); level != cache.rend() && deletions_left; ++level) {
+        auto& entries = level->entries;
+        std::erase_if(entries, [this, gpu_tick, &deletions_left](const StagingBuffer& entry) {
+            if (!deletions_left ||
+                !StagingBufferPolicy::CanRelease(frame, entry.last_use_frame, entry.deferred,
+                                                 entry.tick <= gpu_tick)) {
+                return false;
+            }
+            --deletions_left;
+            return true;
+        });
+        if (level->iterate_index > entries.size()) {
+            level->iterate_index = 0;
+        }
+    }
 }
 
 void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {

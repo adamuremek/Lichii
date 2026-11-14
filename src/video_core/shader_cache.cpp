@@ -121,10 +121,17 @@ u64 ShaderCache::MeshStateHash() const {
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
-    if (!dirty[VideoCommon::Dirty::Shaders]) {
+    const ShaderSources sources{
+        maxwell3d,
+        gpu_memory->GetID(),
+        gpu_memory->MapSerial(),
+        shader_invalidation.load(std::memory_order_acquire),
+    };
+    if (!dirty[VideoCommon::Dirty::Shaders] && shader_sources == sources) {
         return last_shaders_valid;
     }
     dirty[VideoCommon::Dirty::Shaders] = false;
+    shader_sources = sources;
 
     const GPUVAddr base_addr{maxwell3d->regs.program_region.Address()};
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
@@ -398,9 +405,12 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
     if (addr_end > rejected_lowest.load(std::memory_order_relaxed) &&
         addr <= rejected_highest.load(std::memory_order_relaxed)) {
         std::scoped_lock lock{rejected_mutex};
-        boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
+        const auto forgotten = boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
             return rejected.first >= addr && rejected.first < addr_end;
         });
+        if (forgotten != 0) {
+            shader_invalidation.fetch_add(1, std::memory_order_release);
+        }
     }
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
@@ -444,6 +454,7 @@ void ShaderCache::RemovePendingShaders() {
                 return std::ranges::find(removed_shaders, shader.get()) != removed_shaders.end();
             });
         }
+        shader_invalidation.fetch_add(1, std::memory_order_release);
     }
 }
 

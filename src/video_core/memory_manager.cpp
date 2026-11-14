@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -26,6 +27,49 @@
 #include "video_core/texture_cache/util.h"
 
 namespace Tegra {
+namespace {
+
+template <typename Interval>
+class MappingQueryCache {
+public:
+    template <typename Resolve>
+    const Interval& Query(size_t owner, u64 serial, GPUVAddr address, Resolve&& resolve) {
+        const auto matches = [&](const Entry& entry) {
+            return entry.owner == owner && entry.serial == serial &&
+                   entry.interval.Contains(address);
+        };
+        if (!matches(last)) {
+            const u64 page = address >> 12;
+            const size_t slot = (page * 0x9E3779B97F4A7C15ULL) >> 58;
+            Entry& entry = recent[slot];
+            if (!matches(entry)) {
+                entry = {owner, serial, resolve()};
+            }
+            last = entry;
+        }
+        return last.interval;
+    }
+
+private:
+    struct Entry {
+        size_t owner{};
+        u64 serial{};
+        Interval interval{};
+    };
+    Entry last{};
+    std::array<Entry, 64> recent{};
+};
+
+bool UseMappingQueryCache() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_MAP_QUERY_CACHE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+} // namespace
+
 bool MemoryManager::IsShuttingDown() const {
     return system.IsShuttingDown();
 }
@@ -675,18 +719,98 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
     return result;
 }
 
+MemoryManager::MappingInterval MemoryManager::FindContinuousInterval(GPUVAddr address) const {
+    std::scoped_lock lock{runs_guard};
+    const auto next = continuous_runs.upper_bound(address);
+    GPUVAddr begin = 0;
+    if (next != continuous_runs.begin()) {
+        const auto prev = std::prev(next);
+        if (address < prev->second.end) {
+            return {prev->first, prev->second.end, true};
+        }
+        begin = prev->second.end;
+    }
+    const GPUVAddr end = next == continuous_runs.end() ? address_space_size : next->first;
+    return {begin, end, false};
+}
+
+MemoryManager::MappingInterval MemoryManager::FindLayoutInterval(GPUVAddr address) const {
+    std::scoped_lock lock{guard};
+    const auto interval = kind_map.GetInterval(address);
+    return {interval.begin, interval.end, interval.mapped};
+}
+
+size_t MemoryManager::MappingSnapshot::ContinuousRemaining(GPUVAddr address) const {
+    const auto next = std::upper_bound(runs.begin(), runs.end(), address,
+                                       [](GPUVAddr key, const Run& run) { return key < run.begin; });
+    if (next == runs.begin() || address >= std::prev(next)->end) {
+        return 0;
+    }
+    return std::prev(next)->end - address;
+}
+
+size_t MemoryManager::MappingSnapshot::LayoutRemaining(s64 address) const {
+    const auto next = std::upper_bound(kinds.begin(), kinds.end(), address,
+                                       [](s64 key, const auto& range) { return key < range.first; });
+    if (next == kinds.begin() || std::prev(next)->second == PTEKind::INVALID) {
+        return 0;
+    }
+    return static_cast<size_t>((next == kinds.end() ? (std::numeric_limits<s64>::max)()
+                                                   : next->first) - address);
+}
+
+MemoryManager::BufferMappingSizes MemoryManager::GetBufferMappingSizes(GPUVAddr address) const {
+    if (!IsWithinGPUAddressRange(address)) {
+        return {GetMemoryLayoutSize(address), 0};
+    }
+    if (VideoCommon::Nx2Perf::Verify()) {
+        return {GetMemoryLayoutSize(address),
+                MaxContinuousRange(address, address_space_size - address)};
+    }
+    if (!UseMappingQueryCache()) {
+        const auto& view = CurrentSnapshot();
+        return {view.LayoutRemaining(static_cast<s64>(address)), view.ContinuousRemaining(address)};
+    }
+    struct BufferInterval {
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        GPUVAddr layout_end{};
+        GPUVAddr continuous_end{};
+
+        bool Contains(GPUVAddr addr) const {
+            return begin <= addr && addr < end;
+        }
+    };
+    thread_local MappingQueryCache<BufferInterval> cache;
+    const auto& interval = cache.Query(unique_identifier, MapSerial(), address, [&] {
+        const auto layout = FindLayoutInterval(address);
+        const auto continuous = FindContinuousInterval(address);
+        return BufferInterval{
+            (std::max)(layout.begin, continuous.begin),
+            (std::min)(layout.end, continuous.end),
+            layout.mapped ? layout.end : 0,
+            continuous.mapped ? continuous.end : 0,
+        };
+    });
+    return {interval.layout_end != 0 ? interval.layout_end - address : 0,
+            interval.continuous_end != 0 ? interval.continuous_end - address : 0};
+}
+
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     // Native storage buffers ask this for up to 8 MiB on each bind, ~90,000 times a second in
     // Ocarina's Kokiri village: answer from the runs kept at map time instead of walking pages.
     size_t result = 0;
     if (IsWithinGPUAddressRange(gpu_addr) && size <= address_space_size - gpu_addr) {
-        const auto& runs = CurrentSnapshot().runs;
-        const auto it = std::upper_bound(
-            runs.begin(), runs.end(), gpu_addr,
-            [](GPUVAddr address, const MappingSnapshot::Run& run) { return address < run.begin; });
-        if (it != runs.begin() && gpu_addr < std::prev(it)->end) {
-            result = (std::min<size_t>)(size, std::prev(it)->end - gpu_addr);
-        }
+        const size_t remaining = [&] {
+            if (UseMappingQueryCache()) {
+                thread_local MappingQueryCache<MappingInterval> cache;
+                return cache.Query(unique_identifier, MapSerial(), gpu_addr,
+                                   [&] { return FindContinuousInterval(gpu_addr); })
+                    .Remaining(gpu_addr);
+            }
+            return CurrentSnapshot().ContinuousRemaining(gpu_addr);
+        }();
+        result = (std::min)(size, remaining);
     }
     if (VideoCommon::Nx2Perf::Verify()) {
         const size_t expected = MaxContinuousRangeUncached(gpu_addr, size);
@@ -831,16 +955,15 @@ size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size)
 
 size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr,
                                           [[maybe_unused]] size_t max_size) const {
-    // RangeMap::GetContinuousSizeFrom on the snapshot's copy of the kind map, without its lock.
     size_t result = 0;
     const s64 address = static_cast<s64>(gpu_addr);
-    const auto& kinds = CurrentSnapshot().kinds;
-    auto it = std::upper_bound(kinds.begin(), kinds.end(), address,
-                               [](s64 key, const auto& range) { return key < range.first; });
-    if (address >= 0 && it != kinds.begin() && std::prev(it)->second != PTEKind::INVALID) {
-        result = it == kinds.end()
-                     ? static_cast<size_t>((std::numeric_limits<s64>::max)() - address)
-                     : static_cast<size_t>(it->first - address);
+    if (address >= 0 && UseMappingQueryCache()) {
+        thread_local MappingQueryCache<MappingInterval> cache;
+        result = cache.Query(unique_identifier, MapSerial(), gpu_addr,
+                             [&] { return FindLayoutInterval(gpu_addr); })
+                     .Remaining(gpu_addr);
+    } else if (address >= 0) {
+        result = CurrentSnapshot().LayoutRemaining(address);
     }
     if (VideoCommon::Nx2Perf::Verify()) {
         const size_t expected = GetMemoryLayoutSizeUncached(gpu_addr);

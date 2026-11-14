@@ -16,7 +16,7 @@
 
 namespace {
 namespace IR = Shader::IR;
-using Shader::StorageWriteExtent;
+using Shader::StorageAccessExtent;
 
 class TestEnvironment final : public Shader::Environment {
 public:
@@ -86,11 +86,41 @@ IR::U64 Address(IR::IREmitter& ir, u32 offset, const IR::Value& bytes) {
         IR::U32{ir.IAdd(Word(ir, offset), IR::U32{bytes})}, Word(ir, offset + 4)));
 }
 
-std::optional<u64> At(const StorageWriteExtent& extent, std::array<u32, 3> block,
+std::optional<u64> At(const StorageAccessExtent& extent, std::array<u32, 3> block,
                       std::optional<std::array<u32, 3>> grid) {
-    return Shader::ResolveStorageWriteExtent(extent, block, grid);
+    return Shader::ResolveStorageAccessExtent(extent, block, grid);
 }
 } // Anonymous namespace
+
+TEST_CASE("Native compute loads account for their width and dispatch dimensions",
+          "[shader][storage_extent]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    const auto offset = ir.IAdd(ir.Imm32(48), ir.ShiftLeftLogical(ir.WorkgroupIdX(), ir.Imm32(6)));
+    (void)ir.LoadGlobal128(Address(ir, 0x170, offset));
+    (void)ir.LoadGlobalU8(Address(ir, 0x170, ir.Imm32(31)));
+    const auto& descriptor = fixture.Run(0x170);
+    REQUIRE_FALSE(descriptor.is_written);
+    CHECK(descriptor.access_extent.bounded);
+    CHECK(At(descriptor.access_extent, {64, 1, 1}, std::array<u32, 3>{2, 1, 1}) == 128);
+    CHECK(At(descriptor.access_extent, {64, 1, 1}, std::array<u32, 3>{9, 1, 1}) == 576);
+    CHECK_FALSE(At(descriptor.access_extent, {64, 1, 1}, std::nullopt));
+}
+
+TEST_CASE("Unknown compute loads prevent read bounds", "[shader][storage_extent]") {
+    KernelProgram fixture;
+    IR::IREmitter ir{fixture.entry};
+    (void)ir.LoadGlobal64(Address(ir, 0x170, ir.Imm32(64)));
+    SECTION("A load rebased on the same buffer has an unknown offset") {
+        (void)ir.LoadGlobal128(Address(ir, 0x170, Word(ir, 0x180)));
+    }
+    SECTION("A load remains global and can use any buffer") {
+        (void)ir.LoadGlobal32(ir.Imm64(u64{0x1234}));
+    }
+    const auto& descriptor = fixture.Run(0x170);
+    REQUIRE_FALSE(descriptor.is_written);
+    CHECK_FALSE(descriptor.access_extent.bounded);
+}
 
 TEST_CASE("Stores at constant offsets end at the last byte written", "[shader][storage_extent]") {
     KernelProgram fixture;
@@ -101,7 +131,7 @@ TEST_CASE("Stores at constant offsets end at the last byte written", "[shader][s
         ir.Imm32(0), ir.Imm32(0), ir.Imm32(0), ir.Imm32(0)));
     const auto& descriptor{fixture.Run(0x170)};
     REQUIRE(descriptor.is_written);
-    const StorageWriteExtent& extent{descriptor.write_extent};
+    const StorageAccessExtent& extent{descriptor.access_extent};
     CHECK(extent.bounded);
     CHECK_FALSE(extent.guarded);
     CHECK(extent.const_end == 0x44);
@@ -122,7 +152,7 @@ TEST_CASE("Stores indexed by the global invocation id scale with the dispatch",
     const IR::U32 record{ir.ShiftLeftLogical(global, ir.Imm32(8))};
     ir.WriteGlobal64(Address(ir, 0x150, ir.IAdd(record, ir.Imm32(236))),
                      ir.CompositeConstruct(ir.Imm32(0), ir.Imm32(0)));
-    const StorageWriteExtent& extent{fixture.Run(0x150).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x150).access_extent};
     REQUIRE(extent.bounded);
     CHECK(extent.const_end == 244);
     CHECK(extent.local_stride == std::array<u32, 3>{256, 0, 0});
@@ -141,7 +171,7 @@ TEST_CASE("Constant multiplications and masks keep the bound", "[shader][storage
     const IR::U32 row{ir.IMul(ir.WorkgroupIdY(), ir.Imm32(48))};
     ir.WriteGlobal32(Address(ir, 0x160, ir.IAdd(ir.ShiftLeftLogical(lane, ir.Imm32(2)), row)),
                      ir.Imm32(0));
-    const StorageWriteExtent& extent{fixture.Run(0x160).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x160).access_extent};
     REQUIRE(extent.bounded);
     CHECK(extent.const_end == 31 * 4 + 4);
     CHECK(extent.local_stride == std::array<u32, 3>{});
@@ -161,7 +191,7 @@ TEST_CASE("A multiplication split in 16-bit halves is bounded while its operand 
                                   ir.ShiftLeftLogical(ir.IMul(high_half, ir.Imm32(48)),
                                                       ir.Imm32(16)))};
     ir.WriteGlobal32(Address(ir, 0x170, product), ir.Imm32(0));
-    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x170).access_extent};
     REQUIRE(extent.bounded);
     CHECK(extent.guarded);
     CHECK(extent.local_stride == std::array<u32, 3>{48, 0, 0});
@@ -186,13 +216,12 @@ TEST_CASE("Offsets read from memory or other parameters are unbounded",
     ir.WriteGlobal32(Address(ir, 0x170, ir.ShiftLeftLogical(index, ir.Imm32(2))), ir.Imm32(0));
     const auto& descriptor{fixture.Run(0x170)};
     CHECK(descriptor.is_written);
-    CHECK_FALSE(descriptor.write_extent.bounded);
-    CHECK_FALSE(At(descriptor.write_extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1}));
+    CHECK_FALSE(descriptor.access_extent.bounded);
+    CHECK_FALSE(At(descriptor.access_extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1}));
     if (loaded) {
-        // The buffer only read keeps no extent and is not written
         const auto& source{fixture.Run(0x180)};
         CHECK_FALSE(source.is_written);
-        CHECK_FALSE(source.write_extent.bounded);
+        CHECK(At(source.access_extent, {64, 1, 1}, std::nullopt) == 256);
     }
 }
 
@@ -212,7 +241,7 @@ TEST_CASE("Loop-carried store offsets are unbounded", "[shader][storage_extent]"
     const IR::U32 next{body.IAdd(IR::U32{IR::Value{cursor}}, body.Imm32(256))};
     cursor->AddPhiOperand(&fixture.entry, first);
     cursor->AddPhiOperand(&fixture.loop, next);
-    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x170).access_extent.bounded);
 }
 
 TEST_CASE("Selected offsets take the larger alternative", "[shader][storage_extent]") {
@@ -222,7 +251,7 @@ TEST_CASE("Selected offsets take the larger alternative", "[shader][storage_exte
     const IR::U32 offset{ir.Select(condition, ir.Imm32(0x20),
                                    ir.ShiftLeftLogical(ir.LocalInvocationIdX(), ir.Imm32(4)))};
     ir.WriteGlobal32(Address(ir, 0x170, offset), ir.Imm32(0));
-    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x170).access_extent};
     REQUIRE(extent.bounded);
     CHECK(At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1}) == 0x24 + 16 * 63);
 }
@@ -235,18 +264,18 @@ TEST_CASE("A global store left untracked makes every written buffer unbounded",
     // An address with no constant-buffer pointer at all stays a global store
     ir.WriteGlobal32(ir.PackUint2x32(ir.CompositeConstruct(ir.LocalInvocationIdX(), ir.Imm32(0))),
                      ir.Imm32(0));
-    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x170).access_extent.bounded);
 }
 
 TEST_CASE("Store extents merge to cover both", "[shader][storage_extent]") {
-    StorageWriteExtent lhs{.bounded = true, .const_end = 16, .local_stride = {4, 0, 0}};
-    const StorageWriteExtent rhs{.bounded = true, .const_end = 8, .group_stride = {0, 32, 0}};
-    Shader::MergeStorageWriteExtent(lhs, rhs);
+    StorageAccessExtent lhs{.bounded = true, .const_end = 16, .local_stride = {4, 0, 0}};
+    const StorageAccessExtent rhs{.bounded = true, .const_end = 8, .group_stride = {0, 32, 0}};
+    Shader::MergeStorageAccessExtent(lhs, rhs);
     CHECK(lhs.bounded);
     CHECK(lhs.const_end == 16);
     CHECK(lhs.local_stride == std::array<u32, 3>{4, 0, 0});
     CHECK(lhs.group_stride == std::array<u32, 3>{0, 32, 0});
-    Shader::MergeStorageWriteExtent(lhs, StorageWriteExtent{});
+    Shader::MergeStorageAccessExtent(lhs, StorageAccessExtent{});
     CHECK_FALSE(lhs.bounded);
 }
 
@@ -271,7 +300,7 @@ TEST_CASE("An offset that can wrap below zero does not shrink the extent",
     }
     const IR::U32 low_half{ir.BitFieldExtract(value, ir.Imm32(0), ir.Imm32(16), false)};
     ir.WriteGlobal32(Address(ir, 0x170, ir.IMul(low_half, ir.Imm32(4))), ir.Imm32(0));
-    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x170).access_extent};
     const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
     INFO("marked " << (marked ? *marked : 0) << " of " << reach);
     CHECK((!marked || *marked >= reach));
@@ -290,7 +319,7 @@ TEST_CASE("A value that is only an upper bound is not subtracted or used as a mu
                                                ir.Imm32(0x10000))}
                              : IR::U32{ir.ISub(ir.Imm32(0x10000), lane)}};
     ir.WriteGlobal32(Address(ir, 0x170, offset), ir.Imm32(0));
-    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x170).access_extent};
     const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
     INFO("marked " << (marked ? *marked : 0));
     CHECK((!marked || *marked >= 0x10000 + 4));
@@ -307,7 +336,7 @@ TEST_CASE("Scaling a large constant gives up instead of overflowing", "[shader][
         value = IR::U32{ir.IAdd(value, ir.Imm32(negative ? 0x80000000U : 0x7fffffffU))};
     }
     ir.WriteGlobal32(Address(ir, 0x170, ir.ShiftLeftLogical(value, ir.Imm32(31))), ir.Imm32(0));
-    const StorageWriteExtent& extent{fixture.Run(0x170).write_extent};
+    const StorageAccessExtent& extent{fixture.Run(0x170).access_extent};
     // Every invocation stores at 0 or 0x80000000
     const std::optional<u64> marked{At(extent, {64, 1, 1}, std::array<u32, 3>{1, 1, 1})};
     CHECK((!marked || *marked >= 0x80000004ULL));
@@ -329,10 +358,10 @@ TEST_CASE("A store left global between pointers makes every written buffer unbou
     const IR::U32 high{ir.Select(first, Word(ir, 0x154), Word(ir, 0x164))};
     ir.WriteGlobal32(ir.PackUint2x32(ir.CompositeConstruct(low, high)), ir.Imm32(0));
     REQUIRE(fixture.Run(0x150).is_written);
-    CHECK_FALSE(fixture.Run(0x150).write_extent.bounded);
-    CHECK_FALSE(fixture.Run(0x160).write_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x150).access_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x160).access_extent.bounded);
     REQUIRE(fixture.program.info.native_global_bounds);
-    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x170).access_extent.bounded);
 }
 
 TEST_CASE("Offsets whose constant wraps below zero are unbounded", "[shader][storage_extent]") {
@@ -342,5 +371,5 @@ TEST_CASE("Offsets whose constant wraps below zero are unbounded", "[shader][sto
     const IR::U32 shifted{ir.ShiftLeftLogical(
         ir.ISub(ir.LocalInvocationIdX(), ir.Imm32(0x40000000)), ir.Imm32(2))};
     ir.WriteGlobal32(Address(ir, 0x170, ir.IAdd(shifted, ir.Imm32(0x2000))), ir.Imm32(0));
-    CHECK_FALSE(fixture.Run(0x170).write_extent.bounded);
+    CHECK_FALSE(fixture.Run(0x170).access_extent.bounded);
 }

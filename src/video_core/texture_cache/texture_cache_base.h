@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
@@ -49,6 +50,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
+#include "video_core/texture_cache/superseded_images.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -83,6 +85,18 @@ struct TextureHandleRead {
 /// every byte they came from is the same: the handle words, the texture and sampler descriptors
 /// and the tables, mappings and views behind them.
 struct SampledTextureMemo {
+    struct Context {
+        const void* memory;
+        const void* image_table;
+        u64 host_serial;
+        u64 image_changes;
+        u64 sampler_changes;
+        s32 bind_id;
+        bool via_header_index;
+
+        bool operator==(const Context&) const = default;
+    };
+
     struct Entry {
         GPUVAddr handle_address{};
         const u8* handle_host{}; ///< The handle word in host memory
@@ -95,15 +109,26 @@ struct SampledTextureMemo {
         ImageViewId view{};
         SamplerId sampler{};
     };
+
+    [[nodiscard]] bool Matches(Context current, std::span<const GPUVAddr> addresses) const {
+        if (!valid || context != current || entries.size() != addresses.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < addresses.size(); ++i) {
+            const Entry& entry = entries[i];
+            if (entry.handle_address != addresses[i] ||
+                std::memcmp(entry.handle_host, &entry.raw, sizeof(entry.raw)) != 0 ||
+                std::memcmp(entry.tic_host, &entry.tic, sizeof(entry.tic)) != 0 ||
+                std::memcmp(entry.tsc_host, &entry.tsc, sizeof(entry.tsc)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     std::vector<Entry> entries;
-    const void* memory{};      ///< The address space the pointers belong to
-    const void* image_table{}; ///< The channel's table the views were read from
-    u64 host_serial{};         ///< MemoryManager::HostPointerSerial
-    u64 image_changes{};       ///< DescriptorTable::changes of both tables
-    u64 sampler_changes{};
-    bool via_header_index{}; ///< The sampler binding the handles were split with
+    Context context{};
     bool valid{};
-    u32 misses{}; ///< Draws in a row that did not find the memo good
 };
 
 struct AsyncDecodeContext {
@@ -124,6 +149,7 @@ public:
     TextureCacheChannelInfo(const TextureCacheChannelInfo& state) = delete;
     TextureCacheChannelInfo& operator=(const TextureCacheChannelInfo&) = delete;
 
+    const s32 bind_id;
     DescriptorTable<TICEntry, ImageViewId> graphics_image_table;
     DescriptorTable<TSCEntry, SamplerId> graphics_sampler_table;
     DescriptorTable<TICEntry, ImageViewId> compute_image_table;
@@ -289,6 +315,9 @@ public:
 
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
+
+    [[nodiscard]] bool TextureMemoStillHolds(const SampledTextureMemo& memo,
+                                             std::span<const GPUVAddr> handle_addresses) const;
 
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
@@ -475,11 +504,21 @@ private:
     /// Runs the Garbage Collector.
     void RunGarbageCollector(bool out_of_memory);
 
+    /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
+    void DeleteSupersededImages();
+
+    /// Whether the clear being made writes all of an image, bound at gpu_addr as a render target.
+    [[nodiscard]] bool ClearOverwritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
+
+    /// Records the render targets the current clear writes whole (ImageBase::full_write_tick).
+    void NoteWholeClears();
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
     /// Find or create a framebuffer with the given render target parameters
     FramebufferId GetFramebufferId(const RenderTargets& key);
+    bool ReusePreparedRenderTargets(const RenderTargetPreparationKey& key);
 
     /// Refresh the contents (pixel data) of an image
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
@@ -627,6 +666,10 @@ private:
 
     RenderTargets render_targets;
     u64 render_targets_serial = 0;
+    bool reuse_prepared_targets{};
+    std::optional<RenderTargetPreparationKey> prepared_targets;
+    u64 prepared_target_checks{};
+    u64 prepared_target_reuses{};
     u32 rt_active_mask = 0;
     std::array<ImageId, 8> rt_image_id{};
     ImageId rt_depth_image_id{};
@@ -672,14 +715,14 @@ private:
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
-    /// True while FindRenderTargetView looks up or makes its image (see JoinImages).
-    bool inserting_render_target = false;
-    u64 overwritten_targets_deleted{};
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;
     u64 critical_memory;
+    u64 recycler_memory_limit{};
     size_t gpu_unswizzle_maxsize = 0;
     size_t swizzle_chunk_size = 0;
     u32 swizzle_slices_per_batch = 0;
@@ -759,6 +802,13 @@ private:
     std::deque<PendingUnswizzle> unswizzle_queue;
     u8 current_unswizzle_frame;
 
+    // Superseded images (DeleteSupersededImages)
+    std::vector<ImageId> superseded_ids;
+    u64 superseded_activity_frame{}; ///< Last frame a bad overlap appeared or a clear wrote whole
+    u64 superseded_clean_deletes{};
+    u64 superseded_rewritten_deletes{};
+    u64 superseded_unproven{}; ///< Candidates kept for lack of proof, per scan
+
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;
     ::Common::unordered_set<ImageId> join_overlaps_found;
@@ -766,7 +816,6 @@ private:
     boost::container::small_vector<ImageId, 4> join_right_aliased_ids;
     ::Common::unordered_set<ImageId> join_ignore_textures;
     boost::container::small_vector<ImageId, 4> join_bad_overlap_ids;
-    boost::container::small_vector<ImageId, 4> join_overwritten_ids;
     struct JoinCopy {
         bool is_alias;
         ImageId id;

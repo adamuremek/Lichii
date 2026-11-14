@@ -2571,8 +2571,21 @@ bool TextureCacheRuntime::IsFormatScalable(PixelFormat format) {
     }
 }
 
+bool TextureCacheRuntime::CanTransferColorBlit(const Image& dst, const Image& src) const {
+    return dst.Handle() && src.Handle() && dst.Handle() != src.Handle() &&
+           (src.UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+           (dst.UsageFlags() & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+           device.IsFormatSupported(VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+                                    VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                        VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+                                    FormatType::Optimal);
+}
+
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
-                                    std::span<const VideoCommon::ImageCopy> copies) {
+                                    std::span<const VideoCommon::ImageCopy> copies,
+                                    bool sampled_by_graphics) {
     boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
     copies = HostImageCopies(dst, src, copies, host_copies);
     if (copies.empty())
@@ -2608,7 +2621,8 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([dst_image, src_image, aspect_mask, vk_copies,
+                      sampled_by_graphics](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
         RangedBarrierRange src_range;
         for (const VkImageCopy& copy : vk_copies) {
@@ -2676,18 +2690,17 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                 .subresourceRange = dst_range.SubresourceRange(aspect_mask),
             },
         };
-        cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, nullptr, nullptr, pre_barriers);
+        const VkPipelineStageFlags stages =
+            sampled_by_graphics
+                ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                : VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        cmdbuf.PipelineBarrier(stages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, nullptr,
+                               pre_barriers);
         cmdbuf.CopyImage(src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, vk_copies);
-        cmdbuf.PipelineBarrier(
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, nullptr, nullptr, post_barriers);
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, stages, 0, nullptr, nullptr,
+                               post_barriers);
     });
 }
 
@@ -2888,6 +2901,7 @@ void TextureCacheRuntime::LogMemoryStatistics() const {
 }
 
 void TextureCacheRuntime::LogMemoryTrace() {
+    vk::ImageRecycler::LogMemoryTrace();
     LOG_INFO(Render_Vulkan, "Memory trace: staging upload {} MiB, download {} MiB, device {} MiB",
              staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
              staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,

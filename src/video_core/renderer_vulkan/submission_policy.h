@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <optional>
 #include <string_view>
@@ -19,6 +20,31 @@ enum class Action {
     Dispatch,
     Flush,
 };
+
+struct WorkSinceSubmit {
+    /// Count the work before this call. Any submission, including a fence or a download, advances
+    /// the tick and starts a new count.
+    constexpr u32 BeforeWork(u64 current_tick) noexcept {
+        if (tick != current_tick) {
+            tick = current_tick;
+            work = 0;
+        }
+        return work++;
+    }
+
+    u64 tick{};
+    u32 work{};
+};
+
+constexpr bool CheckFrontWait(u32 work, u32 budget) noexcept {
+    return budget > 1 && work < budget - 1 && work >= (std::max)(64U, budget / 4) &&
+           work % 32 == 0;
+}
+
+constexpr bool CheckGpuIdle(u32 work, u32 budget) noexcept {
+    return budget > 1 && work < budget - 1 && work >= (std::max)(128U, budget / 2) &&
+           work % 64 == 0;
+}
 
 inline std::optional<u32> ParseBudget(std::string_view value) {
     if (value.empty()) {

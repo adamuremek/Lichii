@@ -180,7 +180,8 @@ struct StorageBufferDescriptor {
     /// pointer, which is bound as its own descriptor.
     u32 indirect_offset{~0U};
     /// How far the program's stores reach past the pointer (unbounded unless proven)
-    StorageWriteExtent write_extent{};
+    /// Stores for a written descriptor. Loads for a read-only native compute descriptor.
+    StorageAccessExtent access_extent{};
 
     auto operator<=>(const StorageBufferDescriptor&) const = default;
 };

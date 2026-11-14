@@ -64,10 +64,13 @@ struct GpuSplitTestAccess {
         return split.wait_target.load() != ~u64{0};
     }
 
-    static u64 Execute(GpuSplit& split, u64 position, u64 available) {
+    static u64 Execute(GpuSplit& split, u64 position, u64 available,
+                       u64 publish_boundary = ~u64{0}) {
+        split.back_entry_start = position;
         const size_t index = position & GpuSplit::RingMask;
         const size_t size = split.Execute(
-            &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
+            &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index),
+            publish_boundary);
         return position + (size != 0 ? size : GpuSplit::RingWords - index);
     }
 
@@ -92,6 +95,30 @@ struct GpuSplitTestAccess {
         }
         split.consumed.store(position);
         GpuSplit::on_back_thread = false;
+    }
+
+    static void Replay(GpuSplit& split) {
+        split.consumed.store(0);
+        RunBack(split);
+    }
+
+    static void ReplayPublished(GpuSplit& split) {
+        split.active = true;
+        split.back_thread = std::jthread([&split](std::stop_token stop) { split.BackLoop(stop); });
+        split.Drain();
+        split.Stop();
+    }
+
+    static void BatchStateWrites(GpuSplit& split, bool enabled) {
+        split.batch_state_writes = enabled;
+    }
+
+    static void SetWaitTarget(GpuSplit& split, u64 position) {
+        split.wait_target.store(position);
+    }
+
+    static void SetTickPending(GpuSplit& split, bool pending) {
+        split.tick_requested.store(pending);
     }
 };
 
@@ -654,14 +681,145 @@ TEST_CASE("GpuSplit CB batching preserves words at the GPU address space end",
     f.Compare();
 }
 
+TEST_CASE("GpuSplit state batches preserve writes and stop at observable boundaries",
+          "[video_core][maxwell_fast_method][gpu_split_dispatch]") {
+    using Split = VideoCommon::GpuSplit;
+    using Access = VideoCommon::GpuSplitTestAccess;
+    namespace FastDraw = VideoCommon::Nx2FastDraw;
+    SCOPE_EXIT { FastDraw::g_delta = {}; };
+    Fixture f;
+    f.slow.fast_maxwell3d = true;
+    auto reference = std::make_unique<Split>();
+    auto batched = std::make_unique<Split>();
+    const u64 start = Access::NearWrap() - 1;
+    Access::Initialize(*reference, f.system, start);
+    Access::Initialize(*batched, f.system, start);
+    Access::BatchStateWrites(*batched, true);
+    u64 before = start;
+    u64 after = start;
+    const auto checkpoint = [&] {
+        const auto saved = FastDraw::g_delta;
+        const u64 serial_before = FastDraw::Serial();
+        while (before < Access::End(*reference)) {
+            before = Access::Execute(*reference, before, Access::End(*reference));
+        }
+        const bool reference_broke = FastDraw::Serial() != serial_before;
+        const auto delta = FastDraw::g_delta;
+        FastDraw::g_delta = saved;
+        const u64 serial_after = f.fast.ObserveFastDrawSerial();
+        while (after < Access::End(*batched)) {
+            after = Access::Execute(*batched, after, Access::End(*batched));
+        }
+        CHECK((f.fast.ObserveFastDrawSerial() != serial_after) == reference_broke);
+        CHECK(FastDraw::g_delta.binds == delta.binds);
+        CHECK(FastDraw::g_delta.num_writes == delta.num_writes);
+        CHECK(FastDraw::g_delta.write_begin == delta.write_begin);
+        CHECK(FastDraw::g_delta.write_end == delta.write_end);
+        CHECK(f.fast.method_sink == f.slow.method_sink);
+        f.Compare();
+    };
+    const auto direct = [&](u32 method, u32 value) {
+        reference->MacroWrite(&f.slow, method, value);
+        batched->MacroWrite(&f.fast, method, value);
+    };
+    const auto queued = [&](u32 method, u32 value) {
+        reference->Method(&f.slow, method, value, true, nullptr);
+        batched->Method(&f.fast, method, value, true, nullptr);
+    };
+
+    const u32 state = MAXWELL3D_REG_INDEX(viewport_transform);
+    direct(state, 1);
+    direct(state + 1, 2);
+    direct(state + 2, 3);
+    direct(state + 3, 4);
+    direct(state + 4, 5);
+    after = Access::Execute(*batched, after, Access::End(*batched)); // engine switch
+    const u64 first = after;
+    Access::SetWaitTarget(*batched, first + 2);
+    after = Access::Execute(*batched, after, Access::End(*batched));
+    REQUIRE(after == first + 2);
+    Access::SetWaitTarget(*batched, ~u64{0});
+    Access::SetTickPending(*batched, true);
+    after = Access::Execute(*batched, after, Access::End(*batched));
+    REQUIRE(after == first + 3);
+    Access::SetTickPending(*batched, false);
+    checkpoint();
+
+    queued(state, 10);
+    direct(state + 1, 11);
+    queued(state + 2, 12);
+    queued(state + 3, 13);
+    const u64 boundary = after + 2;
+    after = Access::Execute(*batched, after, Access::End(*batched), boundary);
+    REQUIRE(after == boundary);
+    REQUIRE(f.fast.regs.reg_array[state] == 10);
+    REQUIRE(f.fast.regs.reg_array[state + 1] == 11);
+    REQUIRE(f.fast.method_sink.empty());
+    after = Access::Execute(*batched, after, Access::End(*batched));
+    REQUIRE(after == Access::End(*batched));
+    REQUIRE(f.fast.method_sink.size() == 2);
+    CHECK(f.fast.regs.reg_array[state + 2] == 3);
+    CHECK(f.fast.regs.reg_array[state + 3] == 4);
+    direct(state + 4, 14);
+    checkpoint();
+
+    std::mt19937 rng{23};
+    for (u32 step = 0; step < 240; ++step) {
+        CAPTURE(step);
+        f.fast.SetDrawRegisterCoalescing(step >= 120);
+        f.slow.dirty.flags.reset();
+        f.fast.dirty.flags.reset();
+        direct(ShadowControl, step % 4);
+        const u32 argument = rng() % 16;
+        queued(state, argument);
+        for (u32 i = 0, n = 1 + rng() % 80; i < n; ++i) {
+            const u32 method = f.state_methods[rng() % f.state_methods.size()];
+            const u32 value = RandomArgument(rng, method, f.slow);
+            if ((i + step) % 3 == 0) {
+                queued(method, value);
+            } else {
+                direct(method, value);
+            }
+        }
+        direct(CbOffset, (rng() % 0x1000) * 4);
+        direct(CbData, rng());
+        direct(CbData + 1, rng());
+        direct(DrawBegin, 4);
+        direct(MAXWELL3D_REG_INDEX(vertex_buffer.count), 3);
+        direct(DrawEnd, 0);
+        checkpoint();
+    }
+
+    direct(ShadowControl, 0);
+    direct(DrawBegin, 4);
+    direct(MAXWELL3D_REG_INDEX(vertex_buffer.count), 3);
+    direct(DrawEnd, 0);
+    direct(DrawBegin, (1U << 26) | 4);
+    direct(DrawEnd, 0);
+    checkpoint();
+    REQUIRE(f.fast.draw_manager.HasDeferredDraw());
+    direct(state, f.fast.regs.reg_array[state] ^ 1U);
+    direct(state + 1, f.fast.regs.reg_array[state + 1] ^ 1U);
+    const u64 before_deferred = after;
+    after = Access::Execute(*batched, after, Access::End(*batched));
+    REQUIRE(after == before_deferred + 1);
+    REQUIRE_FALSE(f.fast.draw_manager.HasDeferredDraw());
+    checkpoint();
+}
+
 TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]") {
     Fixture f;
     // Per draw, as the back thread sees Ocarina's: state writes the front did not drop, a
     // constant buffer update, three binds and a draw.
+    constexpr u32 StateWords = 12;
+    constexpr u32 UploadWords = 4;
+    constexpr u32 BindWords = 3;
+    constexpr u32 DrawWords = 4;
+    constexpr u32 MethodsPerDraw = StateWords + UploadWords + BindWords + DrawWords;
     std::vector<std::pair<u32, u32>> stream;
     std::mt19937 rng{1};
     for (u32 draw = 0; draw < 4096; ++draw) {
-        for (u32 i = 0; i < 12; ++i) {
+        for (u32 i = 0; i < StateWords; ++i) {
             stream.emplace_back(f.state_methods[rng() % 512], rng() % 8);
         }
         stream.emplace_back(CbOffset, 0x640);
@@ -693,6 +851,114 @@ TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]
     const double slow_ns = run(f.slow);
     const double fast_ns = run(f.fast);
     WARN("CallMethod: " << slow_ns << " ns per method, fast path " << fast_ns << " ns");
+
+    const auto measure_register_breaks = [&](bool coalesce) {
+        f.fast.SetDrawRegisterCoalescing(coalesce);
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 round = 0; round < 60; ++round) {
+            for (const auto& [method, argument] : stream) {
+                f.fast.CallMethod(f.system, method, argument, true);
+                if (method == DrawEnd) {
+                    static_cast<void>(f.fast.ObserveFastDrawSerial());
+                }
+            }
+        }
+        return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start)
+                   .count() /
+               (60.0 * static_cast<double>(stream.size()));
+    };
+    measure_register_breaks(false);
+    measure_register_breaks(true);
+    const double unbatched_a = measure_register_breaks(false);
+    const double coalesced_a = measure_register_breaks(true);
+    const double coalesced_b = measure_register_breaks(true);
+    const double unbatched_b = measure_register_breaks(false);
+    WARN("Register breaks: " << (unbatched_a + unbatched_b) / 2 << " ns per method, coalesced "
+                              << (coalesced_a + coalesced_b) / 2 << " ns");
+
+    // Replay the same synthetic workload through the production split dispatcher. Timing
+    // starts after the entries are queued and excludes GPU rendering.
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr u32 Replays = 100;
+    const auto replay_pair = [&](const auto& sequence, bool interleave_sink) {
+        using Split = VideoCommon::GpuSplit;
+        auto split = std::make_unique<Split>();
+        Access::Initialize(*split, f.system);
+        for (size_t i = 0; i < sequence.size(); ++i) {
+            const auto [method, argument] = sequence[i];
+            const size_t draw_method = i % MethodsPerDraw;
+            if (interleave_sink && draw_method < StateWords && draw_method % 2 == 1) {
+                split->Method(&f.fast, method, argument, true, nullptr, Split::Writes::Noted);
+            } else {
+                split->MacroWrite(&f.fast, method, argument, Split::Writes::Noted);
+            }
+        }
+        const auto measure = [&](bool batch) {
+            Access::BatchStateWrites(*split, batch);
+            Access::Replay(*split);
+            const auto start = std::chrono::steady_clock::now();
+            for (u32 replay = 0; replay < Replays; ++replay) {
+                Access::Replay(*split);
+            }
+            return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() -
+                                                           start)
+                       .count() /
+                   (Replays * static_cast<double>(sequence.size()));
+        };
+        const double single = measure(false);
+        const double batch = measure(true);
+        return std::pair{single, batch};
+    };
+    const auto [replay_ns, batch_ns] = replay_pair(stream, false);
+    WARN("GpuSplit replay: " << replay_ns << " ns per method, state batches " << batch_ns << " ns");
+
+    // Place the same uploads and binds between four-write groups.
+    auto short_runs = stream;
+    constexpr u32 Group = StateWords / 3;
+    for (auto draw = short_runs.begin(); draw != short_runs.end(); draw += MethodsPerDraw) {
+        std::rotate(draw + Group, draw + StateWords, draw + StateWords + UploadWords);
+        std::rotate(draw + Group * 2 + UploadWords, draw + StateWords + UploadWords,
+                    draw + StateWords + UploadWords + BindWords);
+    }
+    const auto [short_ns, short_batch_ns] = replay_pair(short_runs, false);
+    WARN("GpuSplit short runs: " << short_ns << " ns per method, state batches " << short_batch_ns
+                                << " ns");
+    const auto [sparse_ns, sparse_batch_ns] = replay_pair(stream, true);
+    WARN("GpuSplit interleaved sink: " << sparse_ns << " ns per method, state batches "
+                                      << sparse_batch_ns << " ns");
+
+    const auto published_replay = [&](bool batch) {
+        using Split = VideoCommon::GpuSplit;
+        auto split = std::make_unique<Split>();
+        Access::Initialize(*split, f.system);
+        Access::BatchStateWrites(*split, batch);
+        std::chrono::steady_clock::time_point begin, end;
+        split->Defer([&] { begin = std::chrono::steady_clock::now(); });
+        constexpr size_t Rounds = 6;
+        for (size_t round = 0; round < Rounds; ++round) {
+            for (size_t i = 0; i < stream.size(); ++i) {
+                const auto [method, argument] = stream[i];
+                const size_t draw_method = i % MethodsPerDraw;
+                if (draw_method < StateWords && draw_method % 2 == 1) {
+                    split->Method(&f.fast, method, argument, true, nullptr, Split::Writes::Noted);
+                } else {
+                    split->MacroWrite(&f.fast, method, argument, Split::Writes::Noted);
+                }
+            }
+        }
+        split->Defer([&] { end = std::chrono::steady_clock::now(); });
+        Access::ReplayPublished(*split);
+        REQUIRE(end > begin);
+        return std::chrono::duration<double, std::nano>(end - begin).count() /
+               (Rounds * static_cast<double>(stream.size()));
+    };
+    const double published_a = published_replay(false);
+    const double batched_a = published_replay(true);
+    const double batched_b = published_replay(true);
+    const double published_b = published_replay(false);
+    WARN("GPU back interleaved replay: " << (published_a + published_b) / 2
+                                         << " ns per method, state batches "
+                                         << (batched_a + batched_b) / 2 << " ns");
 
     // Three constant buffer words (a draw macro's c[0][0x640..0x648]) one by one or as a run.
     constexpr std::array<u32, 3> methods{CbData, CbData + 1, CbData + 2};

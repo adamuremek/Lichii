@@ -118,6 +118,7 @@ add_library(video_core STATIC
     memory_manager.cpp
     memory_manager.h
     page_filter.h
+    nx2_semaphore_waiters.h
     native_lowering.cpp
     native_lowering.h
     native_qmd.h
@@ -248,6 +249,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_pipeline_cache.h
     renderer_vulkan/vk_pipeline_cache_records.cpp
     renderer_vulkan/vk_pipeline_cache_records.h
+    renderer_vulkan/vk_pipeline_vertex_types.h
     renderer_vulkan/vk_pipeline_binaries.cpp
     renderer_vulkan/vk_pipeline_binaries.h
     renderer_vulkan/vk_shader_cache_v2.cpp
@@ -269,6 +271,7 @@ add_library(video_core STATIC
     renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
+    renderer_vulkan/vk_staging_buffer_policy.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
     renderer_vulkan/vk_state_tracker.cpp
@@ -282,6 +285,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_turbo_mode.h
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
+    renderer_vulkan/vk_vertex_input_cache.h
+    renderer_vulkan/vk_draw_bindings.h
     renderer_vulkan/vk_upload_reorder_check.cpp
     renderer_vulkan/vk_upload_reorder_check.h
     renderer_vulkan/descriptor_payload_growth.h
@@ -332,12 +337,16 @@ add_library(video_core STATIC
     shader_notify.h
     shader_stage_translation.cpp
     shader_stage_translation.h
+    stage_cache.cpp
+    stage_cache.h
     shader_warm/shader_archives.cpp
     shader_warm/shader_archives.h
     shader_warm/shader_warm_builder.cpp
     shader_warm/shader_warm_builder.h
     shader_warm/warm_records.cpp
     shader_warm/warm_records.h
+    spirv_inline_control.cpp
+    spirv_inline_control.h
     smaa_area_tex.h
     smaa_search_tex.h
     surface.cpp
@@ -364,6 +373,7 @@ add_library(video_core STATIC
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
     texture_cache/stale_pages.h
+    texture_cache/superseded_images.h
     texture_cache/texture_cache.cpp
     texture_cache/texture_cache.h
     texture_cache/texture_cache_base.h

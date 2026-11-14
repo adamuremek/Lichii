@@ -278,6 +278,9 @@ struct UserConfig {
     /// writes. On x64, dynarmic currently relies on x64 cmpxchg semantics which may not
     /// provide fully accurate emulation.
     bool fastmem_exclusive_access = false;
+
+    /// x64 LDADD and CAS lowering when fastmem exclusives already bypass the global monitor.
+    bool native_lse_atomics = false;
     /// Determines if exclusive access instructions that pagefault should cause
     /// recompilation of that block with fastmem disabled. Recompiled code will use memory
     /// callbacks.

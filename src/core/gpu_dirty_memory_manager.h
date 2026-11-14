@@ -25,27 +25,17 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
-                    return;
-                }
-                tmp.address = t.address;
-                tmp.mask = 0;
-            }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        while (size) {
+            const size_t bytes = (std::min<size_t>)(size, page_size - (address & page_mask));
+            CollectTransform(BuildTransform(address, bytes));
+            address += bytes;
+            size -= bytes;
+        }
+    }
+
+    [[nodiscard]] bool HasCollectedWrites() const noexcept {
+        // A rollover adds to the back buffer while publishing a nonempty current under guard.
+        return current.load(std::memory_order_acquire).mask != 0;
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
@@ -58,7 +48,7 @@ public:
             pending = back_buffer;
             pending.insert(pending.end(), front_buffer.begin(), front_buffer.end());
             const TransformAddress t = current.load(std::memory_order_acquire);
-            if (IsValid(t.address)) {
+            if (t.mask) {
                 pending.push_back(t);
             }
         }
@@ -67,15 +57,18 @@ public:
         }
     }
 
-    void Gather(std::function<void(PAddr, size_t)>& callback) {
+    void Gather(std::function<void(PAddr, size_t)>& callback, bool skip_empty = false) {
+        if (skip_empty && !HasCollectedWrites()) {
+            return;
+        }
         // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
         // gatherers so one cannot swap or clear front_buffer while another iterates it.
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
-            TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
+            const TransformAddress t = current.exchange(default_transform, std::memory_order_acq_rel);
             front_buffer.swap(back_buffer);
-            if (IsValid(t.address)) {
+            if (t.mask) {
                 front_buffer.emplace_back(t);
             }
         }
@@ -87,9 +80,12 @@ public:
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
     bool Overlaps(PAddr address, size_t size) {
+        if (size == 0) {
+            return false;
+        }
         const PAddr end = address + size;
         const auto overlaps = [&](TransformAddress t) {
-            if (!IsValid(t.address)) {
+            if (!t.mask) {
                 return false;
             }
             const PAddr begin = static_cast<PAddr>(t.address) << page_bits;
@@ -118,6 +114,31 @@ private:
         u32 mask;
     };
 
+    void CollectTransform(TransformAddress write) {
+        TransformAddress previous = current.load(std::memory_order_acquire);
+        do {
+            if (previous.mask && previous.address != write.address) {
+                std::scoped_lock lock{guard};
+                // Reserve the entry before changing current, then keep the value we actually
+                // replaced. A gather or another collector may have moved the earlier snapshot.
+                auto& entry = back_buffer.emplace_back();
+                entry = current.exchange(write, std::memory_order_acq_rel);
+                if (!entry.mask) {
+                    back_buffer.pop_back();
+                }
+                return;
+            }
+            const TransformAddress merged{write.address, write.mask | previous.mask};
+            if (merged.mask == previous.mask) {
+                return;
+            }
+            if (current.compare_exchange_weak(previous, merged, std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+                return;
+            }
+        } while (true);
+    }
+
     template <typename Func>
     static void ForEachRun(const TransformAddress& transform, Func&& callback) {
         size_t offset = 0;
@@ -142,10 +163,6 @@ private:
     constexpr static size_t align_size = 1U << align_bits;
     constexpr static size_t align_mask = align_size - 1;
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
-
-    bool IsValid(PAddr address) {
-        return address < (1ULL << 39);
-    }
 
     template <typename T>
     T CreateMask(size_t top_bit, size_t minor_bit) {

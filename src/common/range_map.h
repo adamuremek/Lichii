@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <limits>
 #include <map>
 #include <type_traits>
 
@@ -47,6 +48,25 @@ public:
             return 0;
         }
         return ContinuousSizeInternal(new_address);
+    }
+
+    struct Interval {
+        KeyTBase begin;
+        KeyTBase end;
+        bool mapped;
+    };
+
+    [[nodiscard]] Interval GetInterval(KeyTBase address) const {
+        const KeyT key = static_cast<KeyT>(address);
+        if (key < 0) {
+            return {};
+        }
+        const auto it = GetFirstElementBeforeOrOn(key);
+        const auto next = std::next(it);
+        const KeyT end = next == container.end() ? (std::numeric_limits<KeyT>::max)()
+                                                 : next->first;
+        const KeyT begin = it->first < 0 ? 0 : it->first;
+        return {static_cast<KeyTBase>(begin), static_cast<KeyTBase>(end), it->second != null_value};
     }
 
     /// Calls func(start, value) for every range, in address order.

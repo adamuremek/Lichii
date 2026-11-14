@@ -21,14 +21,11 @@ public:
 
     /// Records that the cache holds objects on [address, address + size).
     void Mark(u64 address, u64 size) {
-        if (size == 0) {
+        if (size == 0 || address >= AddressLimit) {
             return;
         }
         const u64 first = address >> PageBits;
-        const u64 last = (address + size - 1) >> PageBits;
-        if (last >= NumWords * 64) {
-            return;
-        }
+        const u64 last = (address + (std::min)(size, AddressLimit - address) - 1) >> PageBits;
         for (u64 page = first; page <= last;) {
             const u64 bit = page % 64;
             const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
@@ -46,11 +43,11 @@ public:
         if (size == 0) {
             return false;
         }
-        const u64 first = address >> PageBits;
-        const u64 last = (address + size - 1) >> PageBits;
-        if (last >= NumWords * 64) {
+        if (address >= AddressLimit || size > AddressLimit - address) {
             return true;
         }
+        const u64 first = address >> PageBits;
+        const u64 last = (address + size - 1) >> PageBits;
         for (u64 page = first; page <= last;) {
             const u64 bit = page % 64;
             const u64 count = (std::min<u64>)(64 - bit, last - page + 1);
@@ -65,7 +62,8 @@ public:
 
 private:
     static constexpr u64 PageBits = 12;
-    static constexpr u64 NumWords = (u64{1} << (36 - PageBits)) / 64; // 2 MiB of bits
+    static constexpr u64 AddressLimit = u64{1} << 36;
+    static constexpr u64 NumWords = (AddressLimit >> PageBits) / 64; // 2 MiB of bits
     std::unique_ptr<std::atomic<u64>[]> words;
 };
 

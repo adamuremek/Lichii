@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_profile.h"
 
 namespace VideoCommon {
 
@@ -18,12 +19,29 @@ namespace VideoCommon {
 /// targets, runs of compute dispatches) and records which earlier pass of the frame wrote each
 /// image a pass uses. Every 600 frames it logs how many passes a frame has, how they depend on
 /// each other and how long the frame would take with the passes run on 2, 4, 8 or any number of
-/// threads, in draws. It measures what a back that runs passes in parallel could gain; it
-/// changes nothing. The cost of looking images and buffers up in the caches is not modelled.
+/// threads, in draws. With GPU profiling or stutter tracing, also models the measured time
+/// with cache work, clears and compute kept serial.
 class PassStats {
 public:
+    struct WorkSample {
+        u64 start{};
+        u64 cache{};
+    };
+
     [[nodiscard]] bool Enabled() const noexcept {
         return enabled;
+    }
+
+    [[nodiscard]] WorkSample BeginWork() {
+        if (!enabled || !Nx2Profile::g_zones_enabled) {
+            return {};
+        }
+        if (timing_start_ns == 0) {
+            timing_start_ns = Nx2Profile::Now();
+            timing_start_ticks = Nx2Profile::Ticks();
+        }
+        const u64 cache = CacheTicks();
+        return {Nx2Profile::Ticks(), cache};
     }
 
     void Read(u32 image) {
@@ -49,13 +67,14 @@ public:
         Flush();
     }
 
-    void Draw() {
+    void Draw(WorkSample sample, bool serial = false) {
         if (enabled && !passes.empty()) {
             ++passes.back().work;
+            AccountWork(sample, serial);
         }
     }
 
-    void Compute() {
+    void Compute(WorkSample sample) {
         if (!enabled) {
             return;
         }
@@ -63,6 +82,7 @@ public:
             passes.push_back(Pass{.compute = true});
         }
         ++passes.back().work;
+        AccountWork(sample, true);
         Flush();
     }
 
@@ -96,6 +116,26 @@ public:
                                  : 0.0,
                  total.work / n, total.span[0] / n, speedup(0), total.span[1] / n, speedup(1),
                  total.span[2] / n, speedup(2), total.span[3] / n, speedup(3));
+        if (timing_start_ns != 0) {
+            const u64 ticks = Nx2Profile::Ticks() - timing_start_ticks;
+            const u64 ns = Nx2Profile::Now() - timing_start_ns;
+            const double ms_per_tick_per_frame = static_cast<double>(ns) / ticks / n / 1e6;
+            const auto ms = [ms_per_tick_per_frame](u64 value) {
+                return static_cast<double>(value) * ms_per_tick_per_frame;
+            };
+            LOG_INFO(HW_GPU,
+                     "Pass timing per frame: {:.2f} ms of draw, clear and dispatch work | "
+                     "serial {:.2f} ms (cache {:.2f} ms), remaining graphics {:.2f} ms | "
+                     "estimated total: 2 workers {:.2f} ms, 4 workers {:.2f} ms, 8 workers "
+                     "{:.2f} ms (image dependencies only; excludes methods, waits outside draws "
+                     "and worker overhead)",
+                     ms(total.serial_ticks + total.parallel_ticks), ms(total.serial_ticks),
+                     ms(total.cache_ticks), ms(total.parallel_ticks),
+                     ms(total.serial_ticks + total.timed_span[0]),
+                     ms(total.serial_ticks + total.timed_span[1]),
+                     ms(total.serial_ticks + total.timed_span[2]));
+            timing_start_ns = 0;
+        }
         total = {};
         frames = 0;
     }
@@ -105,6 +145,7 @@ private:
         u64 serial{};
         bool compute{};
         u32 work{};
+        u64 parallel_ticks{};
         std::vector<u32> deps;
     };
 
@@ -115,8 +156,41 @@ private:
         u64 edges{};
         u64 independent{};
         u64 largest{};
+        u64 cache_ticks{};
+        u64 serial_ticks{};
+        u64 parallel_ticks{};
         std::array<u64, 4> span{}; // 2, 4, 8 threads, unlimited
+        std::array<u64, 3> timed_span{};
     };
+
+    static u64 CacheTicks() {
+        using Nx2Profile::Zone;
+        constexpr std::array zones{
+            Zone::PipelineLookup, Zone::GraphicsPipelineMiss, Zone::ComputePipelineMiss,
+            Zone::ShaderCapture, Zone::SyncDescriptors, Zone::ReadHandles, Zone::FillImageViews,
+            Zone::TextureBuffers, Zone::UpdateBuffers, Zone::BindStageBuffers, Zone::RenderTargets,
+            Zone::TextureUpload, Zone::TextureCache, Zone::UniformBuffers, Zone::GeometryBuffers,
+            Zone::StorageBindings,
+        };
+        u64 ticks = 0;
+        for (const Zone zone : zones) {
+            ticks += Nx2Profile::t_data.exclusive_ns[static_cast<size_t>(zone)];
+        }
+        return ticks;
+    }
+
+    void AccountWork(WorkSample sample, bool serial) {
+        if (sample.start == 0) {
+            return;
+        }
+        const u64 elapsed = Nx2Profile::Ticks() - sample.start;
+        const u64 cache = (std::min)(elapsed, CacheTicks() - sample.cache);
+        const u64 parallel = serial ? 0 : elapsed - cache;
+        total.cache_ticks += cache;
+        total.serial_ticks += elapsed - parallel;
+        total.parallel_ticks += parallel;
+        passes.back().parallel_ticks += parallel;
+    }
 
     void Depend(Pass& pass, u32 index, u32 image) {
         const auto it = writer.find(image);
@@ -157,25 +231,40 @@ private:
         // Passes start in stream order, each on the thread that is free first, once the passes
         // it depends on have finished.
         static constexpr std::array<size_t, 4> Threads{2, 4, 8, 0};
-        for (size_t setup = 0; setup < Threads.size(); ++setup) {
-            std::vector<u64> free_at(Threads[setup]);
-            finish.assign(passes.size(), 0);
-            u64 span = 0;
-            for (size_t index = 0; index < passes.size(); ++index) {
-                u64 start = 0;
-                for (const u32 dep : passes[index].deps) {
-                    start = (std::max)(start, finish[dep]);
-                }
-                if (!free_at.empty()) {
-                    const auto thread = std::ranges::min_element(free_at);
-                    start = (std::max)(start, *thread);
-                    *thread = start + passes[index].work;
-                }
-                finish[index] = start + passes[index].work;
-                span = (std::max)(span, finish[index]);
-            }
-            total.span[setup] += span;
+        for (size_t index = 0; index < Threads.size(); ++index) {
+            total.span[index] += EstimateSpan(Threads[index], false);
         }
+        if (timing_start_ns != 0) {
+            for (size_t index = 0; index < total.timed_span.size(); ++index) {
+                total.timed_span[index] += EstimateSpan(Threads[index], true);
+            }
+        }
+    }
+
+    u64 EstimateSpan(size_t workers, bool timed) {
+        std::array<u64, 8> free_at{};
+        finish.resize(passes.size());
+        u64 span = 0;
+        u64 barrier = 0;
+        for (size_t index = 0; index < passes.size(); ++index) {
+            const Pass& pass = passes[index];
+            if (timed && pass.compute) {
+                barrier = span;
+            }
+            u64 start = barrier;
+            for (const u32 dep : pass.deps) {
+                start = (std::max)(start, finish[dep]);
+            }
+            const u64 work = timed ? pass.parallel_ticks : pass.work;
+            if (workers != 0 && work != 0) {
+                const auto thread = std::min_element(free_at.begin(), free_at.begin() + workers);
+                start = (std::max)(start, *thread);
+                *thread = start + work;
+            }
+            finish[index] = start + work;
+            span = (std::max)(span, finish[index]);
+        }
+        return span;
     }
 
     bool enabled = std::getenv("EDEN_NX2_PASS_STATS") != nullptr;
@@ -185,6 +274,8 @@ private:
     std::vector<u64> finish;
     std::unordered_map<u32, u32> writer; // image -> the frame's last pass that wrote it
     Totals total;
+    u64 timing_start_ticks{};
+    u64 timing_start_ns{};
     u32 frames{};
 };
 

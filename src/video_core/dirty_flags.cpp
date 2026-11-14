@@ -62,8 +62,18 @@ void SetupDirtyRenderTargets(Maxwell3D::DirtyState::Tables& tables) {
 }
 
 void SetupDirtyShaders(Maxwell3D::DirtyState::Tables& tables) {
-    FillBlock(tables[0], OFF(pipelines), NUM(pipelines[0]) * Maxwell3D::Regs::MaxShaderProgram,
-              Shaders);
+    using Pipeline = Maxwell3D::Regs::Pipeline;
+    for (size_t stage = 0; stage < Maxwell3D::Regs::MaxShaderProgram; ++stage) {
+        const size_t offset = OFF(pipelines) + stage * NUM(pipelines[0]);
+        constexpr size_t address = offsetof(Pipeline, reserved) / sizeof(u32);
+        tables[0][offset + offsetof(Pipeline, enable) / sizeof(u32)] = Shaders;
+        tables[0][offset + offsetof(Pipeline, offset) / sizeof(u32)] = Shaders;
+        tables[0][offset + address] = Shaders;
+        tables[0][offset + address + 1] = Shaders;
+    }
+    FillBlock(tables[0], OFF(program_region), NUM(program_region), Shaders);
+    // Rasterization disables the fragment stage. Each backend uses table 0 for dynamic state.
+    tables[1][OFF(rasterize_enable)] = Shaders;
     // Task and mesh programs are translated with the mesh registers.
     FillBlock(tables[1], Maxwell3D::Regs::MeshControl, 4, Shaders);
 }

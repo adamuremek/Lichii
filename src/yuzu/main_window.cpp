@@ -3987,18 +3987,21 @@ void MainWindow::OnTasRecord() {
         QtCommon::system->HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
     controller->ResetSystemButtons();
 
-    const bool is_recording = input_subsystem->GetTas()->Record();
+    auto* tas = input_subsystem->GetTas();
+    const bool is_recording = tas->Record();
     if (!is_recording) {
-        if (Settings::values.tas_show_recording_dialog.GetValue()) {
+        if (tas->HasRouteRecordingFile()) {
+            tas->SaveRecording(false);
+        } else if (Settings::values.tas_show_recording_dialog.GetValue()) {
             is_tas_recording_dialog_active = true;
 
             bool answer = question(this, tr("TAS Recording"), tr("Overwrite file of player 1?"),
                                    QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 
-            input_subsystem->GetTas()->SaveRecording(answer);
+            tas->SaveRecording(answer);
             is_tas_recording_dialog_active = false;
         } else {
-            input_subsystem->GetTas()->SaveRecording(true);
+            tas->SaveRecording(true);
         }
     }
     OnTasStateChanged();
@@ -5141,7 +5144,7 @@ void MainWindow::UpdateStatusBar() {
         return;
     }
 
-    if (Settings::values.tas_enable)
+    if (input_subsystem->GetTas()->IsEnabled())
         tas_label->setText(GetTasStateDescription());
     else
         tas_label->clear();

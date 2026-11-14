@@ -205,6 +205,28 @@ public:
         return Inst<IR::U32>(Opcode::A64ExclusiveWriteMemory128, ImmCurrentLocationDescriptor(), vaddr, value, IR::Value{acc_type});
     }
 
+#ifdef ARCHITECTURE_x86_64
+    IR::U32 AtomicAddMemory(const IR::U64& address, const IR::U32& value) noexcept {
+        return Inst<IR::U32>(Opcode::A64AtomicAddMemory32, ImmCurrentLocationDescriptor(), address, value);
+    }
+
+    IR::U64 AtomicAddMemory(const IR::U64& address, const IR::U64& value) noexcept {
+        return Inst<IR::U64>(Opcode::A64AtomicAddMemory64, ImmCurrentLocationDescriptor(), address, value);
+    }
+
+    IR::U32 AtomicCasMemory(const IR::U64& address, const IR::U32& expected,
+                            const IR::U32& desired) noexcept {
+        return Inst<IR::U32>(Opcode::A64AtomicCasMemory32, ImmCurrentLocationDescriptor(), address,
+                             expected, desired);
+    }
+
+    IR::U64 AtomicCasMemory(const IR::U64& address, const IR::U64& expected,
+                            const IR::U64& desired) noexcept {
+        return Inst<IR::U64>(Opcode::A64AtomicCasMemory64, ImmCurrentLocationDescriptor(), address,
+                             expected, desired);
+    }
+#endif
+
     IR::U32 GetW(Reg reg) noexcept {
         if (reg == Reg::ZR)
             return Imm32(0);

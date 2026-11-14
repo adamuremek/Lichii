@@ -7,6 +7,7 @@
  */
 
 #include <cstddef>
+#include <cstdlib>
 #include <type_traits>
 
 #include "common/assert.h"
@@ -21,6 +22,16 @@
 namespace Dynarmic::Backend::X64 {
 
 using namespace Xbyak::util;
+
+namespace {
+bool FastUnsignedDivision() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FAST_UNSIGNED_DIV");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+}  // namespace
 
 void EmitX64::EmitPack2x32To1x64(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -1166,6 +1177,10 @@ void EmitX64::EmitUnsignedDiv32(EmitContext& ctx, IR::Inst* inst) {
     Xbyak::Label end;
 
     code.xor_(eax, eax);
+    if (FastUnsignedDivision()) {
+        code.cmp(dividend, divisor);
+        code.jb(end, code.T_SHORT);
+    }
     code.test(divisor, divisor);
     code.jz(end, code.T_NEAR);
     code.mov(eax, dividend);
@@ -1187,6 +1202,10 @@ void EmitX64::EmitUnsignedDiv64(EmitContext& ctx, IR::Inst* inst) {
     Xbyak::Label end;
 
     code.xor_(eax, eax);
+    if (FastUnsignedDivision()) {
+        code.cmp(dividend, divisor);
+        code.jb(end, code.T_SHORT);
+    }
     code.test(divisor, divisor);
     code.jz(end, code.T_NEAR);
     code.mov(rax, dividend);

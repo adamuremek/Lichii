@@ -17,6 +17,7 @@
 #include "core/hle/kernel/k_thread_local_page.h"
 #include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/k_worker_task_manager.h"
+#include "core/oot_zstd_hook.h"
 
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -127,6 +128,7 @@ void GenerateRandom(std::span<u64> out_random) {
 } // namespace
 
 void KProcess::Finalize(KernelCore& kernel) {
+    Core::OotZstd::EndSession(*this);
     // Delete the process local region.
     this->DeleteThreadLocalRegion(kernel, m_plr_address);
 

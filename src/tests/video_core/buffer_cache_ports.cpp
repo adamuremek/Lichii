@@ -5,6 +5,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -40,6 +41,8 @@ struct Buffer : VideoCommon::BufferBase {
     Buffer(Runtime&, VideoCommon::NullBufferParams params) : BufferBase{params} {}
     Buffer(Runtime&, DAddr address, u32 size, bool mapped)
         : BufferBase{address, size}, bytes(size), host_mapped{mapped} {}
+    Buffer(Runtime&, DAddr address, u32 size, u32 backed_size)
+        : BufferBase{address, size}, bytes(backed_size) {}
 
     void MarkUsage(u64 offset, u64 size) {
         REQUIRE(offset + size <= bytes.size());
@@ -69,6 +72,13 @@ struct Runtime {
     u64 GetDeviceLocalMemory() const {
         return 0;
     }
+    bool RetainsLargeBuffers() const {
+        return retain_large_buffers;
+    }
+    u64 LargeBufferRetentionLimit() {
+        ++headroom_checks;
+        return retention_limit;
+    }
     u64 GetMaxStorageBufferRange() const {
         return 1ULL << 30;
     }
@@ -82,6 +92,9 @@ struct Runtime {
         return tick <= completed_tick;
     }
     u64 CurrentTick() const {
+        if (observe_tick) {
+            observe_tick();
+        }
         return submitted_tick + 1;
     }
     void WaitSubmittedTick(u64) {}
@@ -99,6 +112,15 @@ struct Runtime {
     Staging UploadStagingBuffer(u64 size) {
         return DownloadStagingBuffer(size);
     }
+    static constexpr size_t MinimumSplitUploadSize = 128;
+    std::vector<Staging> TryLargeUploadStaging(size_t) {
+        std::vector<Staging> slices;
+        for (size_t size : large_upload_slices) {
+            slices.push_back(UploadStagingBuffer(size));
+        }
+        return slices;
+    }
+    std::vector<size_t> large_upload_slices;
     void FreeDeferredStagingBuffer(Staging&) {}
     /// Buffer to buffer, as when a new buffer takes over the ones it overlaps.
     void CopyBuffer(Buffer& dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
@@ -126,6 +148,19 @@ struct Runtime {
                             copy.size);
             });
             ++downloads;
+        }
+    }
+    struct ReadbackCopy {
+        Buffer* source;
+        VideoCommon::BufferCopy copy;
+    };
+    bool BatchesReadbackCopies() const {
+        return batch_readbacks;
+    }
+    void CopyReadbackBatch(Buffer* staging, std::span<const ReadbackCopy> copies) {
+        ++readback_batches;
+        for (const auto& [source, copy] : copies) {
+            CopyBuffer(staging, *source, std::span{&copy, 1}, false);
         }
     }
     void CopyBuffer(Buffer& dst, Buffer* src, std::span<const VideoCommon::BufferCopy> copies, bool,
@@ -202,6 +237,11 @@ struct Runtime {
     }
 
     u32 alignment{256};
+    bool batch_readbacks{};
+    bool retain_large_buffers{};
+    u64 retention_limit{};
+    u32 headroom_checks{};
+    u32 readback_batches{};
     u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
     u32 host_read_barriers{}, host_read_waits{}, queued_host_reads{};
     u64 upload_bytes{}, waited_tick{};
@@ -211,6 +251,7 @@ struct Runtime {
     std::vector<std::function<void()>> pending;
     std::deque<std::pair<u64, std::vector<std::function<void()>>>> submitted;
     std::function<void()> before_completion;
+    std::function<void()> observe_tick;
 };
 
 struct Tracker : VideoCommon::MemoryTrackerBase<Tegra::MaxwellDeviceMemoryManager> {
@@ -277,9 +318,10 @@ namespace VideoCommon {
 struct BufferCacheTestAccess {
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
                         bool written = false, bool native = false, bool table = false,
-                        bool compute = false) {
+                        bool compute = false, u32 max_read_bytes = 0) {
         cache.gpu_memory = &memory;
-        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute);
+        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute,
+                                          max_read_bytes);
     }
     template <class C>
     static BufferId Add(C& cache, DAddr address, u32 size, bool mapped = false) {
@@ -290,6 +332,21 @@ struct BufferCacheTestAccess {
     }
     static Buffer& Get(Cache& cache, BufferId id) {
         return cache.slot_buffers[id];
+    }
+    static BufferId AddLarge(Cache& cache, DAddr address, u32 size) {
+        const auto id = cache.slot_buffers.insert(cache.runtime, address, size, u32{4096});
+        cache.Register(id);
+        return id;
+    }
+    static void Collect(Cache& cache, BufferCacheChannelInfo& channel, u64 frame, u64 usage) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.frame_tick = frame;
+        cache.total_used_memory = usage;
+        cache.CollectNativeBuffers();
+    }
+    static bool Contains(const Cache& cache, BufferId id) {
+        return cache.slot_buffers.contains(id);
     }
     static void Dirty(Cache& cache, DAddr address, u64 size) {
         cache.memory_tracker.MarkRegionAsGpuModified(address, size);
@@ -327,6 +384,26 @@ struct BufferCacheTestAccess {
     static void Upload(Cache& cache, BufferId id, DAddr address, u32 size) {
         (void)cache.SynchronizeBuffer(cache.slot_buffers[id], address, size);
     }
+    static void StorageUpload(Cache& cache, const Binding& binding, bool written = false) {
+        cache.SynchronizeGraphicsStorageBuffer(cache.slot_buffers[binding.buffer_id], binding,
+                                               written);
+    }
+    static void SetStorageScanReuse(Cache& cache, bool enabled) {
+        cache.reuse_storage_scans = enabled;
+    }
+    static auto StorageSyncStats(Cache& cache) {
+        return cache.storage_sync_stats;
+    }
+    static void MarkCachedCpuWrite(Cache& cache, DAddr address, u64 size) {
+        cache.memory_tracker.CachedCpuWrite(address, size);
+    }
+    static void InvalidateBufferIds(Cache& cache) {
+        ++cache.buffer_deletions;
+    }
+    static void UploadCopies(Cache& cache, Buffer& buffer, u64 size,
+                             std::span<BufferCopy> copies) {
+        cache.MappedUploadMemory(buffer, size, copies);
+    }
     /// A guest write the buffer cache doesn't hear of, on a page the tracker counts as written.
     static void MarkCpuModified(Cache& cache, DAddr address, u64 size) {
         cache.memory_tracker.MarkRegionAsCpuModified(address, size);
@@ -345,8 +422,9 @@ struct BufferCacheTestAccess {
     static u32 CpuMarks(Cache& cache) {
         return cache.memory_tracker.cpu_marks;
     }
-    static void MarkWritten(Cache& cache, BufferId id, DAddr address, u32 size) {
-        cache.MarkWrittenBuffer(id, address, size);
+    static void MarkWritten(Cache& cache, BufferId id, DAddr address, u32 size,
+                            bool needs_sync = false) {
+        cache.MarkWrittenBuffer(id, address, size, needs_sync);
     }
     /// A dispatch or copy wrote [address, address + size) of buffer `id` (Nx2NoteListWrite).
     static void ListWrite(Cache& cache, BufferId id, DAddr address, u64 size) {
@@ -367,20 +445,20 @@ struct BufferCacheTestAccess {
     }
     static void KeepDraw(KeepCache& cache, BufferCacheChannelInfo& channel,
                          const Nx2FastDraw::Delta* delta, BufferId id, DAddr address,
-                         u32 size) {
+                         u32 size, bool full_draw = false) {
         cache.channel_state = &channel;
         cache.maxwell3d = &channel.maxwell3d;
         cache.gpu_memory = &channel.gpu_memory;
-        cache.BeginGraphicsUniforms(delta);
+        cache.BeginGraphicsUniforms(delta, full_draw);
         channel.uniform_buffers[0][0] = {.device_addr = address, .size = size, .buffer_id = id};
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
     }
     struct KeepCounts {
-        u64 kept, streamed, verified, mismatches;
+        u64 kept, streamed, verified, mismatches, kept_full;
     };
     static KeepCounts Counts(const KeepCache& cache) {
         const auto& keep = cache.uniform_keep;
-        return {keep.kept, keep.streamed_binds, keep.verified, keep.mismatches};
+        return {keep.kept, keep.streamed_binds, keep.verified, keep.mismatches, keep.kept_full};
     }
     static void GpuWrite(KeepCache& cache, BufferId id, DAddr address, u32 size) {
         cache.MarkWrittenBuffer(id, address, size);
@@ -445,10 +523,77 @@ struct BasicFixture {
         std::memcpy(bytes + 8, &size, sizeof(size));
     }
     VideoCommon::Binding Bind(bool written = false, bool native = false, bool table = false,
-                              bool compute = false) {
-        return Access::Bind(*cache, *memory, 0x100000, written, native, table, compute);
+                              bool compute = false, u32 max_read_bytes = 0) {
+        return Access::Bind(*cache, *memory, 0x100000, written, native, table, compute,
+                            max_read_bytes);
     }
 };
+
+TEST_CASE("Buffer uploads split packed data across staging buffers and preserve destination gaps",
+          "[video_core][buffer_cache][staging]") {
+    BasicFixture<Runtime, Cache> fixture;
+    const auto id = Access::Add(*fixture.cache, 0x10000, 0x1000);
+    Buffer& buffer = Access::Get(*fixture.cache, id);
+    std::ranges::fill(buffer.bytes, 0xff);
+    for (u32 i = 0; i < 512; ++i) {
+        fixture.bytes[i] = static_cast<u8>(i % 251);
+    }
+    std::array<VideoCommon::BufferCopy, 3> copies{{
+        {0, 0, 64},
+        {64, 128, 96},
+        {160, 448, 32},
+    }};
+    fixture.runtime.large_upload_slices = {40, 64, 88};
+    Access::UploadCopies(*fixture.cache, buffer, 192, copies);
+
+    CHECK(fixture.runtime.allocations == 3);
+    CHECK(fixture.runtime.uploads == 5);
+    CHECK(fixture.runtime.upload_bytes == 192);
+    for (size_t i = 0; i < 512; ++i) {
+        const bool copied = i < 64 || (i >= 128 && i < 224) || (i >= 448 && i < 480);
+        CHECK(buffer.bytes[i] == (copied ? fixture.bytes[i] : 0xff));
+    }
+}
+
+TEST_CASE("Native buffer collection keeps one large allocation only with headroom",
+          "[video_core][buffer_cache][staging]") {
+    BasicFixture<Runtime, Cache> fixture;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*fixture.memory;
+    state.payload.emplace(fixture.system, *fixture.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    auto& cache = *fixture.cache;
+    fixture.runtime.retain_large_buffers = true;
+    constexpr u64 limit = 12ULL << 30;
+    fixture.runtime.retention_limit = limit;
+
+    const auto old = Access::AddLarge(cache, 0x80000000, 512U << 20);
+    const auto large = Access::AddLarge(cache, 0x100000000, 1091502080U);
+    Access::Get(cache, large).bytes.front() = 0x5e;
+
+    Access::Collect(cache, channel, 121, limit);
+    CHECK_FALSE(Access::Contains(cache, old));
+    REQUIRE(Access::Contains(cache, large));
+    CHECK(Access::Get(cache, large).bytes.front() == 0x5e);
+    CHECK(fixture.runtime.headroom_checks == 1);
+
+    SECTION("The retention expires when the buffer stays unused") {
+        Access::Collect(cache, channel, 5399, limit);
+        CHECK(Access::Contains(cache, large));
+        Access::Collect(cache, channel, 5400, limit);
+        CHECK_FALSE(Access::Contains(cache, large));
+    }
+    SECTION("Pressure restores normal eviction and clears the tracked slot") {
+        Access::Collect(cache, channel, 122, limit + 1);
+        CHECK_FALSE(Access::Contains(cache, large));
+
+        const auto small = Access::Add(cache, 0x10000, 4096);
+        CHECK(small == large);
+        Access::Collect(cache, channel, 200, limit + 1);
+        CHECK(Access::Contains(cache, small));
+        CHECK(fixture.runtime.headroom_checks == 1);
+    }
+}
 
 /// Hands FinishRead to a buffer cache, as RasterizerVulkan does.
 class ReadRasterizer final : public VideoCore::RasterizerInterface {
@@ -550,8 +695,8 @@ struct KeepFixture : EnvGate, BasicFixture<KeepRuntime, KeepCache> {
         return bytes + (Ubo - 0x10000);
     }
     /// Draws and checks that the bound uniform data is what guest memory holds.
-    void Draw(const VideoCommon::Nx2FastDraw::Delta* delta) {
-        Access::KeepDraw(*cache, *channel, delta, id, Ubo, UboSize);
+    void Draw(const VideoCommon::Nx2FastDraw::Delta* delta, bool full_draw = false) {
+        Access::KeepDraw(*cache, *channel, delta, id, Ubo, UboSize, full_draw);
         const auto& data = runtime.allocations.at(runtime.bound.allocation);
         REQUIRE(data.size() == UboSize);
         REQUIRE(std::memcmp(data.data(), UboBytes(), UboSize) == 0);
@@ -579,6 +724,140 @@ VideoCommon::Nx2FastDraw::Delta Written(DAddr begin, DAddr end) {
 }
 
 } // namespace
+
+TEST_CASE("Hot upload pages stay dirty without rearming their write protection", "[buffer_ports]") {
+    struct ProtectionTracker {
+        void UpdatePagesCachedBatch(std::span<const std::pair<VAddr, size_t>> ranges, s32 delta) {
+            for (const auto& [start, size] : ranges) {
+                for (VAddr page = start; page < start + size; page += Core::DEVICE_PAGESIZE) {
+                    changes.emplace_back(page, delta);
+                }
+            }
+        }
+
+        std::vector<std::pair<VAddr, s32>> changes;
+    } protection;
+    VideoCommon::MemoryTrackerBase tracker{protection};
+    constexpr u64 page_size = Core::DEVICE_PAGESIZE;
+    constexpr VAddr hot_page = (1ULL << 22) - page_size;
+    constexpr VAddr next_page = hot_page + page_size;
+    const auto collect = [](auto& out) {
+        return [&out](VAddr address, size_t size) { out.emplace_back(address, size); };
+    };
+    using Range = std::pair<VAddr, size_t>;
+    std::vector<Range> uploads;
+    tracker.ForEachDirtyUploadRange(hot_page, 2 * page_size, collect(uploads));
+    CHECK(uploads == std::vector<Range>{{hot_page, page_size}, {next_page, page_size}});
+    tracker.WatchSynchronized(0, hot_page, page_size);
+    tracker.WatchSynchronized(1, next_page, page_size);
+
+    protection.changes.clear();
+    tracker.SetHotPage(hot_page + 4, true);
+    tracker.SetHotPage(hot_page, true);
+    CHECK(protection.changes == std::vector<std::pair<VAddr, s32>>{{hot_page, -1}});
+    CHECK_FALSE(tracker.IsSynchronized(0));
+    CHECK(tracker.IsSynchronized(1));
+    tracker.WatchSynchronized(0, hot_page, page_size);
+    CHECK_FALSE(tracker.IsSynchronized(0));
+
+    tracker.MarkRegionAsCpuModified(next_page, page_size);
+    protection.changes.clear();
+    uploads.clear();
+    tracker.ForEachDirtyUploadRange<true>(hot_page, 2 * page_size, collect(uploads));
+    CHECK(uploads == std::vector<Range>{{next_page, page_size}});
+    CHECK(protection.changes == std::vector<std::pair<VAddr, s32>>{{next_page, 1}});
+    CHECK(tracker.IsRegionCpuModified(hot_page, page_size));
+    CHECK(tracker.CleanWordsHold(hot_page, 2 * page_size));
+    std::vector<Range> hot_ranges;
+    tracker.ForEachHotRange(hot_page, 2 * page_size, collect(hot_ranges));
+    CHECK(hot_ranges == std::vector<Range>{{hot_page, page_size}});
+    uploads.clear();
+    tracker.ForEachDirtyUploadRange<true>(hot_page, page_size, collect(uploads));
+    CHECK(uploads.empty());
+
+    tracker.SetHotPage(hot_page, false);
+    tracker.SetHotPage(hot_page, false);
+    CHECK_FALSE(tracker.IsRegionHot(hot_page, 2 * page_size));
+    protection.changes.clear();
+    tracker.ForEachDirtyUploadRange<true>(hot_page, 2 * page_size, collect(uploads));
+    CHECK(uploads == std::vector<Range>{{hot_page, page_size}});
+    CHECK(protection.changes == std::vector<std::pair<VAddr, s32>>{{hot_page, 1}});
+    tracker.WatchSynchronized(0, hot_page, page_size);
+    CHECK(tracker.IsSynchronized(0));
+}
+
+TEST_CASE("Read-only storage scans reuse only the last synchronized buffer range", "[buffer_ports]") {
+    Fixture f;
+    constexpr DAddr address = 0x20000;
+    constexpr u32 size = 4 * 1024 * 1024;
+    const auto id = Access::Add(*f.cache, address, size);
+    const VideoCommon::Binding binding{.device_addr = address, .size = size, .buffer_id = id};
+
+    Access::SetStorageScanReuse(*f.cache, true);
+    Access::StorageUpload(*f.cache, binding);
+    Access::MarkCpuModified(*f.cache, address - 16, 1);
+    Access::StorageUpload(*f.cache, binding);
+    CHECK(Access::StorageSyncStats(*f.cache).syncs_skipped == 1);
+
+    auto& buffer = Access::Get(*f.cache, id);
+    f.bytes[0x10040] = 0x5a;
+    Access::MarkCpuModified(*f.cache, address + 64, 1);
+    Access::StorageUpload(*f.cache, binding);
+    CHECK(buffer.bytes[64] == 0x5a);
+    CHECK(Access::StorageSyncStats(*f.cache).syncs_skipped == 1);
+
+    f.bytes[0x10040] = 0x91;
+    Access::MarkCachedCpuWrite(*f.cache, address + 64, 1);
+    f.cache->FlushCachedWrites();
+    Access::StorageUpload(*f.cache, binding);
+    CHECK(buffer.bytes[64] == 0x91);
+    CHECK(Access::StorageSyncStats(*f.cache).syncs_skipped == 1);
+
+    Access::InvalidateBufferIds(*f.cache);
+    Access::StorageUpload(*f.cache, binding);
+    CHECK(Access::StorageSyncStats(*f.cache).syncs_skipped == 1);
+    Access::StorageUpload(*f.cache, binding, true);
+    auto short_binding = binding;
+    short_binding.size = 4096;
+    Access::StorageUpload(*f.cache, short_binding);
+    CHECK(Access::StorageSyncStats(*f.cache).syncs == 5);
+    CHECK(Access::StorageSyncStats(*f.cache).verify_mismatches == 0);
+}
+
+TEST_CASE("Wide storage binding scan cost under guest writes", "[.storage_scan_bench]") {
+    constexpr DAddr address = 0x20000;
+    constexpr u32 iterations = 256'000;
+    for (const u32 size_mib : {4, 32, 128}) {
+        Fixture f;
+        const u32 size = size_mib * 1024 * 1024;
+        const auto id = Access::Add(*f.cache, address, size);
+        const VideoCommon::Binding binding{.device_addr = address, .size = size, .buffer_id = id};
+        auto& buffer = Access::Get(*f.cache, id);
+        for (const bool reuse : {false, true}) {
+            Access::SetStorageScanReuse(*f.cache, reuse);
+            const u64 skipped = Access::StorageSyncStats(*f.cache).syncs_skipped;
+            const auto start = std::chrono::steady_clock::now();
+            for (u32 i = 0; i < iterations; ++i) {
+                if (i % 16 == 0) {
+                    Access::MarkCpuModified(*f.cache, address - 16, 1);
+                }
+                if (i % 256 == 0) {
+                    f.bytes[0x10040] = static_cast<u8>(i / 256);
+                    Access::MarkCpuModified(*f.cache, address + 64, 1);
+                }
+                Access::StorageUpload(*f.cache, binding);
+            }
+            const std::chrono::duration<double, std::nano> elapsed =
+                std::chrono::steady_clock::now() - start;
+            const u64 hits = Access::StorageSyncStats(*f.cache).syncs_skipped - skipped;
+            CHECK(hits == (reuse ? iterations - iterations / 256 : 0));
+            CHECK(buffer.bytes[64] == static_cast<u8>((iterations - 1) / 256));
+            std::printf("storage range %u %s: %.2f ns per scan (%llu skipped)\n", size_mib,
+                        reuse ? "reuse" : "baseline", elapsed.count() / iterations,
+                        static_cast<unsigned long long>(hits));
+        }
+    }
+}
 
 TEST_CASE("Storage binding cache tracks map changes and descriptor dependencies",
           "[buffer_ports]") {
@@ -627,15 +906,37 @@ TEST_CASE("Storage binding cache preserves native and table size policies", "[bu
     f.Descriptor(base, 256);
     REQUIRE(f.Bind().size == 4096);
     REQUIRE(f.Bind(false, true).size == 8 << 20);
-    REQUIRE(f.Bind(false, true, false, true).size == 80 << 20);
+    REQUIRE(f.Bind(false, true, false, true).size == 8 << 20);
     REQUIRE(f.Bind(true, true, false, true).size == 8 << 20);
     REQUIRE(f.Bind(false, false, true).size == 80 << 20);
+    f.Descriptor(base, 40 << 20);
+    REQUIRE(f.Bind(false, true, false, true).size == 40 << 20);
+    REQUIRE(f.Bind(true, true, false, true).size == 8 << 20);
+    REQUIRE(f.Bind(false, true).size == 8 << 20);
+    f.Descriptor(base, 100 << 20);
+    REQUIRE(f.Bind(false, true, false, true).size == 8 << 20);
+    f.Descriptor(base, 256);
     REQUIRE(f.Bind(true, false, true).size == 256);
     f.Descriptor(base, (1ULL << 32) | 256);
     REQUIRE(f.Bind().size == 8 << 20);
     REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     f.Descriptor(base + (79 << 20), 0);
     REQUIRE(f.Bind(false, false, true).size == 1 << 20);
+}
+
+TEST_CASE("Bounded compute reads preserve the aligned base and trim each dispatch independently",
+          "[buffer_ports]") {
+    Fixture f;
+    constexpr GPUVAddr base = 0x4000000;
+    f.memory->Map(base, 0x10000000, 80 << 20, Tegra::PTEKind::PITCH, true);
+    f.Descriptor(base + 0x101, 40 << 20);
+    const auto full = f.Bind(false, true, false, true);
+    const auto first_page = f.Bind(false, true, false, true, 0xeff);
+    CHECK(first_page.gpu_addr == full.gpu_addr);
+    CHECK(first_page.device_addr == full.device_addr);
+    CHECK(first_page.size == 0xf00);
+    CHECK(f.Bind(false, true, false, true, 0xf00).size == 0x1f00);
+    CHECK(f.Bind(false, true, false, true).size == full.size);
 }
 
 TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[buffer_ports]") {
@@ -657,6 +958,7 @@ TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[bu
 TEST_CASE("Batch downloads clamp buffers, deduplicate pages and finish before publication",
           "[buffer_ports]") {
     Fixture f;
+    f.runtime.batch_readbacks = GENERATE(false, true);
     const auto first = Access::Add(*f.cache, 0x20000, 0x10000);
     const auto second = Access::Add(*f.cache, 0x30000, 0x10000);
     std::ranges::fill(Access::Get(*f.cache, first).bytes, 0x12);
@@ -676,6 +978,7 @@ TEST_CASE("Batch downloads clamp buffers, deduplicate pages and finish before pu
     REQUIRE(f.runtime.finishes == 1);
     REQUIRE(f.runtime.allocations == 1);
     REQUIRE(f.runtime.downloads == 2);
+    CHECK(f.runtime.readback_batches == (f.runtime.batch_readbacks ? 1 : 0));
     REQUIRE(f.bytes[0x1f000] == 0x12);
     REQUIRE(f.bytes[0x1ffff] == 0x12);
     REQUIRE(f.bytes[0x20000] == 0x34);
@@ -1079,6 +1382,30 @@ TEST_CASE("Downloads keep CPU writes collected and not yet applied", "[buffer_po
     REQUIRE(f.bytes[0x21008] == 0x34);
 }
 
+TEST_CASE("A GPU buffer write publishes its page before recording the write tick",
+          "[buffer_ports]") {
+    Fixture f;
+    constexpr DAddr address = 0x22000;
+    constexpr u64 page_size = Core::DEVICE_PAGESIZE;
+    const auto id = Access::Add(*f.cache, address, 2 * page_size);
+    const bool previous = Tegra::g_nx2_ampere.exchange(true);
+    Tegra::Nx2ClearGpuWrittenPages();
+    SCOPE_EXIT {
+        Tegra::Nx2ClearGpuWrittenPages();
+        Tegra::g_nx2_ampere.store(previous);
+    };
+    CHECK_FALSE(VideoCore::MayHoldGpuWrites(address, page_size));
+    bool checked = false;
+    f.runtime.observe_tick = [&] {
+        CHECK(VideoCore::MayHoldGpuWrites(address, page_size));
+        CHECK_FALSE(VideoCore::MayHoldGpuWrites(address + page_size, page_size));
+        checked = true;
+    };
+    Access::MarkWritten(*f.cache, id, address + 64, 16, true);
+    CHECK(checked);
+    CHECK(Access::Pending(*f.cache, address, page_size));
+}
+
 TEST_CASE("Read downloads stay GPU-modified until the reading thread writes them",
           "[buffer_ports]") {
     Fixture f;
@@ -1112,6 +1439,44 @@ TEST_CASE("Read downloads stay GPU-modified until the reading thread writes them
     REQUIRE(f.cache->GetFlushArea(0x20800, 4)->preemtive);
     f.cache->FinishReadDownloads(0x20000, 0x2000);
     REQUIRE(f.runtime.host_read_waits == 1);
+}
+
+TEST_CASE("Staged readback batches preserve gaps and wait before publishing", "[buffer_ports]") {
+    Fixture f;
+    f.runtime.batch_readbacks = true;
+    Access::CheckEveryRead(*f.cache);
+    const auto first = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto second = Access::Add(*f.cache, 0x30000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, first).bytes, 0x12);
+    std::ranges::fill(Access::Get(*f.cache, second).bytes, 0x34);
+    Access::Dirty(*f.cache, 0x2e020, 0x10);
+    Access::Dirty(*f.cache, 0x2f080, 0x20);
+    Access::Dirty(*f.cache, 0x30030, 0x10);
+    f.cache->SetPendingCpuWrites([](const std::function<void(DAddr, size_t)>& callback) {
+        callback(0x2f088, 8);
+    });
+    std::memset(f.bytes + 0x1f088, 0xee, 8);
+
+    f.cache->DownloadMemoryForRead(0x2e000, 0x3000);
+    REQUIRE(f.runtime.readback_batches == 1);
+    REQUIRE(f.runtime.downloads == 6); // Three staged ranges and three reference copies.
+    CHECK(f.runtime.submitted_tick == 1);
+    CHECK(f.bytes[0x1e020] == 0);
+    CHECK(f.bytes[0x20030] == 0);
+    f.cache->FinishReadDownloads(0x2e000, 0x3000);
+    CHECK(f.runtime.host_read_waits == 1);
+    CHECK(f.bytes[0x1e01f] == 0);
+    CHECK(f.bytes[0x1e020] == 0x12);
+    CHECK(f.bytes[0x1e02f] == 0x12);
+    CHECK(f.bytes[0x1e030] == 0);
+    CHECK(f.bytes[0x1f087] == 0x12);
+    CHECK(f.bytes[0x1f088] == 0xee);
+    CHECK(f.bytes[0x1f08f] == 0xee);
+    CHECK(f.bytes[0x1f090] == 0x12);
+    CHECK(f.bytes[0x2002f] == 0);
+    CHECK(f.bytes[0x20030] == 0x34);
+    CHECK(f.bytes[0x2003f] == 0x34);
+    CHECK(f.bytes[0x20040] == 0);
 }
 
 TEST_CASE("Read downloads keep CPU writes made while they were on their way", "[buffer_ports]") {
@@ -2296,6 +2661,60 @@ TEST_CASE("Uniform keep never keeps across command buffers", "[buffer_ports]") {
     f.Draw(nullptr);
     f.Draw(&unchanged);
     REQUIRE(f.Counts().kept == 1);
+}
+
+TEST_CASE("Full draws keep only uniforms still eligible for streaming", "[buffer_ports]") {
+    KeepFixture f{nullptr};
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    f.Draw(nullptr);
+    f.Draw(&unchanged, true);
+    REQUIRE(f.Counts().kept_full == 1);
+    REQUIRE(f.runtime.allocations.size() == 1);
+
+    f.UboBytes()[0x20] = 7;
+    f.cache->WriteMemory(KeepFixture::Ubo + 0x20, 1);
+    f.Draw(&unchanged, true);
+    REQUIRE(f.Counts().kept_full == 1);
+    REQUIRE(f.runtime.allocations.size() == 2);
+
+    ++f.runtime.tick;
+    f.Draw(&unchanged, true);
+    REQUIRE(f.Counts().kept_full == 1);
+    REQUIRE(f.runtime.allocations.size() == 3);
+
+    f.channel->uniform_buffer_skip_cache_size = 0;
+    Access::KeepDraw(*f.cache, *f.channel, &unchanged, f.id, KeepFixture::Ubo, KeepFixture::UboSize,
+                     true);
+    REQUIRE(f.Counts().kept_full == 1);
+    REQUIRE(f.runtime.allocations.size() == 3);
+}
+
+TEST_CASE("Streamed uniform binding cost on full draws", "[.full_uniform_keep_bench]") {
+    KeepFixture f{nullptr};
+    const VideoCommon::Nx2FastDraw::Delta unchanged{};
+    constexpr u32 iterations = 128'000;
+    for (const u32 size : {256, 1024, 4096}) {
+        f.sizes[0][0] = size;
+        f.channel->uniform_buffer_skip_cache_size = size;
+        std::memset(f.UboBytes(), 7, size);
+        Access::KeepDraw(*f.cache, *f.channel, nullptr, f.id, KeepFixture::Ubo, size);
+        for (const bool keep : {false, true}) {
+            const u64 count_before = f.Counts().kept_full;
+            const auto begin = std::chrono::steady_clock::now();
+            for (u32 i = 0; i < iterations; ++i) {
+                Access::KeepDraw(*f.cache, *f.channel, keep ? &unchanged : nullptr, f.id,
+                                 KeepFixture::Ubo, size, keep);
+            }
+            const std::chrono::duration<double, std::nano> elapsed =
+                std::chrono::steady_clock::now() - begin;
+            CHECK(f.Counts().kept_full - count_before == (keep ? iterations : 0));
+            const auto& bytes = f.runtime.allocations.at(f.runtime.bound.allocation);
+            REQUIRE(bytes.size() == size);
+            CHECK(std::memcmp(bytes.data(), f.UboBytes(), size) == 0);
+            std::printf("uniform size %u %s: %.2f ns per bind\n", size, keep ? "kept" : "baseline",
+                        elapsed.count() / iterations);
+        }
+    }
 }
 
 TEST_CASE("Uniform keep verify counts guest writes the delta did not report",

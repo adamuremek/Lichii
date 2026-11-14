@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -166,4 +167,106 @@ TEST_CASE("Uniform stream keeps require the same range and live allocation", "[v
     REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 64, 64));
     VideoCommon::ResetUniformStreamReuse<Runtime>();
     CHECK_FALSE(RebindKeptUniform(runtime, 0, 0, 64, 64));
+}
+
+TEST_CASE("Compute stream reuse preserves dispatch snapshots and leaves GPU patches fresh",
+          "[video_core]") {
+    using VideoCommon::BindSmallComputeUniformReusing;
+    using VideoCommon::BindSmallUniformReusing;
+    Memory memory;
+    Runtime runtime;
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    constexpr u32 size = 256;
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, size));
+    REQUIRE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, false));
+    const auto first = runtime.bound;
+    REQUIRE(first.allocation == 1);
+    REQUIRE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, false));
+    REQUIRE(runtime.bound.allocation == first.allocation);
+
+    REQUIRE_FALSE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, true));
+    auto patched = runtime.BindMappedUniformBuffer(0, 0, size);
+    memory.ReadBlockUnsafe(0, patched.data(), size);
+    patched[4] = 0xA5;
+    REQUIRE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, false));
+    REQUIRE(runtime.bound.allocation == first.allocation);
+    CheckBound(runtime, memory, 0, size);
+
+    memory.bytes[4] = 0x59;
+    REQUIRE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, false));
+    REQUIRE(runtime.bound.allocation == 3);
+    CHECK(runtime.allocations[first.allocation][4] == 0);
+    CheckBound(runtime, memory, 0, size);
+    runtime.NextTick();
+    REQUIRE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, false));
+    REQUIRE(runtime.allocations.size() == 1);
+    CheckBound(runtime, memory, 0, size);
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    REQUIRE(BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0, size, false));
+    REQUIRE(runtime.allocations.size() == 2);
+    REQUIRE_FALSE(BindSmallComputeUniformReusing(runtime, memory, 8, 0, 0, size, false));
+}
+
+TEST_CASE("Compute stream reuse allocation benchmark", "[.compute_uniform_benchmark]") {
+    struct BenchMemory {
+        std::array<u8, 256> bytes{};
+        const u8* GetSpan(u64 address, size_t) const {
+            return bytes.data() + address;
+        }
+        void ReadBlockUnsafe(u64 address, void* dest, u32 size) const {
+            std::memcpy(dest, bytes.data() + address, size);
+        }
+    } memory;
+    struct BenchRuntime {
+        struct StreamUniformRef {
+            size_t allocation;
+        };
+        u64 CurrentTick() const { return tick; }
+        StreamUniformRef LastStreamUniformRef() const { return last; }
+        std::span<u8> BindMappedUniformBuffer(size_t, u32, u32 size) {
+            last = bound = StreamUniformRef{next++};
+            return std::span{allocations[last.allocation]}.first(size);
+        }
+        void RebindStreamUniform(StreamUniformRef ref, u32) { bound = ref; }
+        std::vector<std::array<u8, 256>> allocations{1024};
+        StreamUniformRef last{}, bound{};
+        size_t next{};
+        u64 tick{};
+    } runtime;
+    constexpr u32 size = 256;
+    constexpr size_t dispatches = 1024 * 512;
+    for (const bool changing : {false, true}) {
+        for (size_t run = 0; run < 10; ++run) {
+            const bool reuse = (run / 2 + run % 2) % 2 != 0;
+            size_t allocations = 0;
+            const auto start = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < dispatches; ++i) {
+                if ((i & 1023) == 0) {
+                    allocations += runtime.next;
+                    runtime.next = 0;
+                    ++runtime.tick;
+                }
+                if (changing && (i & 15) == 0) {
+                    memory.bytes[4] ^= 1;
+                }
+                if (reuse) {
+                    (void)VideoCommon::BindSmallComputeUniformReusing(runtime, memory, 0, 0, 0,
+                                                                     size, false);
+                } else {
+                    auto span = runtime.BindMappedUniformBuffer(0, 0, size);
+                    memory.ReadBlockUnsafe(0, span.data(), size);
+                }
+            }
+            const auto elapsed = std::chrono::duration<double, std::nano>(
+                std::chrono::steady_clock::now() - start).count();
+            allocations += runtime.next;
+            runtime.next = 0;
+            REQUIRE(allocations == (reuse ? (changing ? dispatches / 16 : dispatches / 1024)
+                                           : dispatches));
+            REQUIRE(runtime.allocations[runtime.bound.allocation] == memory.bytes);
+            std::printf("Compute uniforms %s %s: %.2f ns per bind, %zu allocations\n",
+                        changing ? "changing" : "stable", reuse ? "reuse" : "original",
+                        elapsed / dispatches, allocations);
+        }
+    }
 }

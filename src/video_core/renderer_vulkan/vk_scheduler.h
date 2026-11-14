@@ -194,6 +194,10 @@ public:
     /// Update the pipeline to the current execution context.
     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
 
+    [[nodiscard]] bool ReuseDrawBindings() const noexcept {
+        return reuse_draw_bindings;
+    }
+
     /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
     /// recorded after it must be dropped instead of reaching the driver without a pipeline.
     void SetGraphicsPipelineMissing(bool missing) {
@@ -255,6 +259,13 @@ public:
             },
             location, RecordSite::Own, 0);
     }
+
+    /// Work may still be pending before it is recorded into a command chunk.
+    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
+        return record_serial != submitted_serial || uploads_pending || reordered_uploads_pending ||
+               deferred_clear.framebuffer != nullptr;
+    }
+    static void CountSkippedFlush();
 
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
@@ -370,6 +381,8 @@ public:
 private:
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
+    u64 record_serial{};
+    u64 submitted_serial{};
 
     class Command {
     public:
@@ -477,6 +490,7 @@ private:
             // Uploads recorded before this command go before it.
             FlushUploads();
         }
+        ++record_serial;
         if (!chunk->Record(command)) {
             DispatchWork();
             (void)chunk->Record(command);
@@ -543,6 +557,7 @@ private:
 
     const Device& device;
     StateTracker& state_tracker;
+    const bool reuse_draw_bindings;
 
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;

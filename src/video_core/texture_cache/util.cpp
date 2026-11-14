@@ -1487,6 +1487,28 @@ bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
     return std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
 }
 
+bool CanTransferWholeColorImage(const ImageBase& dst, const ImageBase& src, GPUVAddr dst_addr,
+                                GPUVAddr src_addr, Extent3D extent) noexcept {
+    constexpr auto format = VideoCore::Surface::PixelFormat::B10G11R11_FLOAT;
+    constexpr ImageFlagBits excluded =
+        ImageFlagBits::Converted | ImageFlagBits::Rescaled | ImageFlagBits::Remapped |
+        ImageFlagBits::BadOverlap | ImageFlagBits::Sparse | ImageFlagBits::Unbacked |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
+        ImageFlagBits::TrimmedLevels | ImageFlagBits::IsDecoding;
+    const auto matches = [&](const ImageBase& image, GPUVAddr address) {
+        return image.gpu_addr == address && image.info.format == format &&
+               image.info.type == ImageType::e2D && image.info.size == extent &&
+               image.info.num_samples == 1 && image.info.resources.levels == 1 &&
+               image.info.resources.layers == 1 && !image.info.is_sparse &&
+               False(image.flags & excluded) && image.aliased_images.empty() &&
+               image.overlapping_images.empty();
+    };
+    return dst_addr != src_addr && extent.width && extent.height && extent.depth == 1 &&
+           matches(dst, dst_addr) && matches(src, src_addr) &&
+           !dst.Overlaps(src.cpu_addr, src.guest_size_bytes) &&
+           !dst.OverlapsGPU(src.gpu_addr, src.guest_size_bytes);
+}
+
 boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const ImageInfo& info) {
     const Extent2D tile_size = DefaultBlockSize(info.format);
     if (info.type == ImageType::Linear) {
@@ -1555,6 +1577,15 @@ bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32
         const Extent3D rhs_size = BlockLinearAlignedSize(rhs, rhs_level);
         return lhs_size.width == rhs_size.width && lhs_size.height == rhs_size.height;
     }
+}
+
+bool IsPaddedSquare(const ImageInfo& info) noexcept {
+    if (info.type != ImageType::e2D || info.num_samples != 1 || info.size.width <= info.size.height) {
+        return false;
+    }
+    ImageInfo square = info;
+    square.size.width = info.size.height;
+    return IsBlockLinearSizeCompatible(info, square, 0, 0, false);
 }
 
 bool IsBlockLinearSizeCompatibleBPPRelaxed(const ImageInfo& lhs, const ImageInfo& rhs,

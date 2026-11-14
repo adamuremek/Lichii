@@ -32,4 +32,10 @@ constexpr u64 HostCriticalMemory(u64 device_usage, u64 commit_room) {
     return (std::max)(limit - (std::min)(limit, HostCommitReserve), MinHostCriticalMemory);
 }
 
+/// Return only as much recycled memory as fits under the device and host limits.
+constexpr u64 RecycledImageBytesToKeep(u64 usage, u64 kept, u64 limit) {
+    const u64 excess = usage > limit ? usage - limit : 0;
+    return kept - (std::min)(kept, excess);
+}
+
 } // namespace VideoCommon

@@ -55,3 +55,15 @@ TEST_CASE("Page filter answers conservatively outside its range", "[video_core][
     CHECK(filter.Any(Limit, Page));
     CHECK_FALSE(filter.Any(0, Page));
 }
+
+TEST_CASE("Page filter covers the tracked prefix of a mark crossing its limit",
+          "[video_core][page_filter]") {
+    constexpr u64 Limit = u64{1} << 36;
+    PageFilter filter;
+    CHECK(filter.Any(Limit - 1, 2));
+    filter.Mark(Limit - 2 * Page + 1, ~u64{0});
+    CHECK(filter.Any(Limit - 2 * Page, 1));
+    CHECK(filter.Any(Limit - 1, 1));
+    CHECK_FALSE(filter.Any(Limit - 3 * Page, Page));
+    CHECK_FALSE(filter.Any(0, Page));
+}

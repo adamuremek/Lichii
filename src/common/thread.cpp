@@ -6,17 +6,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "common/adpf.h"
 #include "common/core_pinning.h"
+#include "common/dkb_cpu_trace.h"
 #include "common/error.h"
 #include "common/event_wait.h"
+#include "common/gpu_benchmark_trial.h"
 #include "common/logging.h"
 #include "common/assert.h"
 #include "common/thread.h"
@@ -491,6 +496,10 @@ const WindowsCpuSets& CpuSets() {
                  GetCurrentProcess(), 0)) {
             return result;
         }
+        DWORD_PTR allowed_mask{}, system_mask{};
+        const bool has_process_mask = GetActiveProcessorGroupCount() == 1 &&
+                                      GetProcessAffinityMask(GetCurrentProcess(), &allowed_mask,
+                                                             &system_mask);
         u8 best = 0;
         for (ULONG offset = 0; offset + sizeof(SYSTEM_CPU_SET_INFORMATION) <= length;) {
             const auto* info =
@@ -499,11 +508,17 @@ const WindowsCpuSets& CpuSets() {
                 break;
             }
             if (info->Type == CpuSetInformation) {
-                const u32 core =
-                    (static_cast<u32>(info->CpuSet.Group) << 8) | info->CpuSet.CoreIndex;
-                result.processors.push_back({static_cast<u32>(info->CpuSet.Id), core,
-                                             static_cast<u8>(info->CpuSet.EfficiencyClass)});
-                best = (std::max)(best, static_cast<u8>(info->CpuSet.EfficiencyClass));
+                const auto& cpu = info->CpuSet;
+                const u32 group = static_cast<u32>(cpu.Group) << 8;
+                const bool usable = has_process_mask && cpu.Group == 0 &&
+                                    cpu.LogicalProcessorIndex < std::numeric_limits<DWORD_PTR>::digits &&
+                                    (allowed_mask & (DWORD_PTR{1} << cpu.LogicalProcessorIndex)) != 0 &&
+                                    (!cpu.Allocated || cpu.AllocatedToTargetProcess);
+                result.processors.push_back({
+                    static_cast<u32>(cpu.Id), group | cpu.CoreIndex, cpu.EfficiencyClass,
+                    usable ? std::optional<u32>{group | cpu.LastLevelCacheIndex} : std::nullopt,
+                });
+                best = (std::max)(best, cpu.EfficiencyClass);
             }
             offset += info->Size;
         }
@@ -534,17 +549,119 @@ const WindowsCpuSets& CpuSets() {
     return sets;
 }
 
-void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
+bool SelectThreadCpuSets(HANDLE thread, std::span<const ULONG> ids) {
     using PFN_SetThreadSelectedCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
     static const auto set = reinterpret_cast<PFN_SetThreadSelectedCpuSets>(reinterpret_cast<void*>(
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets")));
     if (set == nullptr) {
-        return;
+        return false;
     }
-    if (!set(GetCurrentThread(), ids.empty() ? nullptr : ids.data(),
-             static_cast<ULONG>(ids.size()))) {
+    if (!set(thread, ids.empty() ? nullptr : ids.data(), static_cast<ULONG>(ids.size()))) {
         LOG_WARNING(Common, "SetThreadSelectedCpuSets failed: {}", Common::GetLastErrorMsg());
+        return false;
     }
+    return true;
+}
+
+void SelectCurrentThreadCpuSets(const std::vector<ULONG>& ids) {
+    SelectThreadCpuSets(GetCurrentThread(), ids);
+}
+
+bool CacheLocalStartupEnabled() {
+    const char* value = std::getenv("EDEN_NX2_LOCAL_CPU_CACHES");
+    return value && std::string_view{value} == "1" &&
+           Common::GpuBenchmarkTrial::ConfiguredExperiment() !=
+               Common::GpuBenchmarkTrial::Experiment::CpuPlacement;
+}
+
+const Common::GpuThreadPinning& CacheLocalPlan() {
+    static const auto plan = Common::PlanGpuThreadPinning(
+        CpuSets().processors, Common::DkbCpuTrace::GuestCoreCount);
+    return plan;
+}
+
+const Common::GpuThreadPinning& WindowsGpuPinning() {
+    static const Common::GpuThreadPinning pinned = [] {
+        const bool cache_local = CacheLocalStartupEnabled();
+        auto plan = cache_local ? CacheLocalPlan() : Common::PlanGpuThreadPinning(CpuSets().processors);
+        if (plan.front.empty()) {
+            LOG_WARNING(Common,
+                        "GPU thread pinning skipped: {} physical performance cores, needs {}",
+                        plan.performance_cores, Common::MinCoresForGpuThreadPinning);
+        } else if (!plan.guest_by_core.empty()) {
+            LOG_INFO(Common, "GPU thread pinning: {} guest cores in one last-level cache; "
+                             "front, back and Vulkan worker in the other",
+                     plan.guest_by_core.size());
+        } else {
+            LOG_INFO(Common,
+                     "GPU thread pinning: front and back on a physical core each, guest cores on the "
+                     "other {} performance cores ({} logical processors)",
+                     plan.performance_cores - 2, plan.guest.size());
+        }
+        if (cache_local && plan.guest_by_core.empty()) {
+            LOG_INFO(Common, "Cache-local CPU placement unavailable on this processor topology");
+        }
+        return plan;
+    }();
+    return pinned;
+}
+
+void SelectPinnedCpuSets(const std::vector<u32>& ids) {
+    if (!ids.empty()) {
+        SelectCurrentThreadCpuSets({ids.begin(), ids.end()});
+    }
+}
+
+std::optional<std::vector<ULONG>> ReadCurrentThreadCpuSets() {
+    using GetCpuSets = BOOL(WINAPI*)(HANDLE, PULONG, ULONG, PULONG);
+    static const auto get = reinterpret_cast<GetCpuSets>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadSelectedCpuSets")));
+    if (!get) {
+        return std::nullopt;
+    }
+    ULONG count{};
+    if (get(GetCurrentThread(), nullptr, 0, &count)) {
+        return std::vector<ULONG>{};
+    }
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || count == 0) {
+        return std::nullopt;
+    }
+    std::vector<ULONG> ids(count);
+    if (!get(GetCurrentThread(), ids.data(), count, &count)) {
+        return std::nullopt;
+    }
+    ids.resize(count);
+    return ids;
+}
+
+struct CpuPlacementRegistry {
+    static constexpr size_t WorkerSlot = Common::DkbCpuTrace::GuestCoreCount;
+
+    struct Thread {
+        HANDLE handle{};
+        std::vector<ULONG> baseline;
+        std::vector<ULONG> candidate;
+        bool local{};
+    };
+
+    std::mutex mutex;
+    std::array<Thread, WorkerSlot + 1> threads;
+};
+
+CpuPlacementRegistry& PlacementRegistry() {
+    static CpuPlacementRegistry registry{};
+    return registry;
+}
+
+bool RestorePlacement(CpuPlacementRegistry& registry) {
+    bool restored = true;
+    for (auto& thread : registry.threads) {
+        if (thread.local) {
+            thread.local = !SelectThreadCpuSets(thread.handle, thread.baseline);
+            restored &= !thread.local;
+        }
+    }
+    return restored;
 }
 } // Anonymous namespace
 #endif
@@ -730,33 +847,10 @@ void SetCurrentThreadToPerformanceCores() {
 
 void PinCurrentThread(PinnedRole role) {
 #ifdef _WIN32
-    struct PinnedCpuSets {
-        std::vector<ULONG> front;
-        std::vector<ULONG> back;
-        std::vector<ULONG> guest;
-    };
-    static const PinnedCpuSets pinned = [] {
-        const GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
-        if (plan.front.empty()) {
-            LOG_WARNING(Common,
-                        "GPU thread pinning skipped: {} physical performance cores, needs {}",
-                        plan.performance_cores, MinCoresForGpuThreadPinning);
-            return PinnedCpuSets{};
-        }
-        LOG_INFO(Common,
-                 "GPU thread pinning: front and back on a physical core each, guest cores on the "
-                 "other {} performance cores ({} logical processors)",
-                 plan.performance_cores - 2, plan.guest.size());
-        return PinnedCpuSets{{plan.front.begin(), plan.front.end()},
-                             {plan.back.begin(), plan.back.end()},
-                             {plan.guest.begin(), plan.guest.end()}};
-    }();
-    const std::vector<ULONG>& ids = role == PinnedRole::GpuFront  ? pinned.front
-                                    : role == PinnedRole::GpuBack ? pinned.back
-                                                                  : pinned.guest;
-    if (!ids.empty()) {
-        SelectCurrentThreadCpuSets(ids);
-    }
+    const auto& pinned = WindowsGpuPinning();
+    SelectPinnedCpuSets(role == PinnedRole::GpuFront  ? pinned.front
+                       : role == PinnedRole::GpuBack ? pinned.back
+                                                     : pinned.guest);
 #elif defined(__linux__) && !defined(__ANDROID__)
     static const GpuThreadPinning plan = [] {
         GpuThreadPinning result = PlanGpuThreadPinning(LinuxProcessors());
@@ -784,6 +878,105 @@ void PinCurrentThread(PinnedRole role) {
         LOG_INFO(Common, "GPU thread pinning is only supported on Windows and Linux");
         return true;
     }();
+#endif
+}
+
+void PinCurrentGuestCore(size_t core) {
+#ifdef _WIN32
+    const auto& guest_by_core = WindowsGpuPinning().guest_by_core;
+    if (core < guest_by_core.size()) {
+        SelectPinnedCpuSets(guest_by_core[core]);
+        return;
+    }
+#else
+    (void)core;
+#endif
+    PinCurrentThread(PinnedRole::GuestCore);
+}
+
+void PinCurrentVulkanWorker() {
+#ifdef _WIN32
+    if (CacheLocalStartupEnabled()) {
+        SelectPinnedCpuSets(WindowsGpuPinning().vulkan_worker);
+    }
+#endif
+}
+
+CpuPlacementTrialThread::CpuPlacementTrialThread(DkbCpuTrace::Role role, bool pin_gpu_threads) {
+#ifdef _WIN32
+    using Trial = GpuBenchmarkTrial::Experiment;
+    if (!pin_gpu_threads || GpuBenchmarkTrial::ConfiguredExperiment() != Trial::CpuPlacement) {
+        return;
+    }
+    constexpr size_t worker = CpuPlacementRegistry::WorkerSlot;
+    const size_t index = role == DkbCpuTrace::Role::VulkanWorker ? worker : static_cast<size_t>(role);
+    const auto& plan = CacheLocalPlan();
+    if (index > worker || role == DkbCpuTrace::Role::GuestSingleCore ||
+        plan.guest_by_core.size() != worker) {
+        return;
+    }
+    const auto& ids = index == worker ? plan.vulkan_worker : plan.guest_by_core[index];
+    auto baseline = ReadCurrentThreadCpuSets();
+    if (!baseline || ids.empty()) {
+        return;
+    }
+    auto& registry = PlacementRegistry();
+    std::scoped_lock lock{registry.mutex};
+    auto& thread = registry.threads[index];
+    if (!thread.handle &&
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                        &thread.handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        thread.baseline = std::move(*baseline);
+        thread.candidate.assign(ids.begin(), ids.end());
+        slot = index;
+    }
+#else
+    (void)role;
+    (void)pin_gpu_threads;
+#endif
+}
+
+CpuPlacementTrialThread::~CpuPlacementTrialThread() {
+#ifdef _WIN32
+    if (slot) {
+        auto& registry = PlacementRegistry();
+        std::scoped_lock lock{registry.mutex};
+        auto& thread = registry.threads[*slot];
+        CloseHandle(thread.handle);
+        thread = {};
+        GpuBenchmarkTrial::Acknowledge(0);
+    }
+#endif
+}
+
+bool ApplyCpuPlacementTrial(CpuPlacementTrialMode mode, u32 ticket) {
+#ifdef _WIN32
+    auto& registry = PlacementRegistry();
+    std::scoped_lock lock{registry.mutex};
+    if (mode == CpuPlacementTrialMode::Restore) {
+        return RestorePlacement(registry);
+    }
+    if (!std::ranges::all_of(registry.threads, [](const auto& thread) { return thread.handle; })) {
+        return false;
+    }
+    if (mode == CpuPlacementTrialMode::Baseline) {
+        if (!RestorePlacement(registry)) {
+            return false;
+        }
+    } else {
+        for (auto& thread : registry.threads) {
+            if (!thread.local && !SelectThreadCpuSets(thread.handle, thread.candidate)) {
+                RestorePlacement(registry);
+                return false;
+            }
+            thread.local = true;
+        }
+    }
+    GpuBenchmarkTrial::Acknowledge(ticket);
+    return true;
+#else
+    (void)ticket;
+    return mode == CpuPlacementTrialMode::Restore;
 #endif
 }
 

@@ -133,6 +133,14 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
+    u32 RepackedVertexBindings() const {
+        return vertex_repack_mask;
+    }
+
+    u64 VertexStrideSerial() const {
+        return vertex_stride_serial;
+    }
+
     bool AnyVertexRepacked() const {
         return vertex_repack_mask != 0;
     }
@@ -174,6 +182,8 @@ public:
     u64 GetDeviceMemoryUsage() const;
 
     bool CanReportMemoryUsage() const;
+    bool RetainsLargeBuffers() const;
+    u64 LargeBufferRetentionLimit() const;
 
     u32 GetUniformBufferAlignment() const;
 
@@ -183,6 +193,9 @@ public:
     u64 GetMaxStorageBufferRange() const;
 
     [[nodiscard]] StagingBufferRef UploadStagingBuffer(size_t size);
+    static constexpr size_t MinimumSplitUploadSize =
+        StagingBufferPolicy::WarmUploadArenaBlockSize + 1;
+    [[nodiscard]] LargeUploadStaging TryLargeUploadStaging(size_t size);
 
     [[nodiscard]] StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
@@ -202,6 +215,17 @@ public:
                     std::span<const VideoCommon::BufferCopy> copies, bool barrier,
                     VideoCommon::UploadOrder order = {},
                     std::source_location location = std::source_location::current());
+
+    struct ReadbackCopy {
+        Buffer* source;
+        VideoCommon::BufferCopy copy;
+    };
+    [[nodiscard]] bool BatchesReadbackCopies() const noexcept {
+        return batch_readback_copies;
+    }
+    /// Copies into disjoint ranges of a dedicated download staging allocation.
+    void CopyReadbackBatch(VkBuffer staging, std::span<const ReadbackCopy> copies,
+                           std::source_location location = std::source_location::current());
 
     void PostCopyBarrier();
 
@@ -378,6 +402,7 @@ private:
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     GuestDescriptorQueue& guest_descriptor_queue;
+    const bool batch_readback_copies;
 
     std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
     std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
@@ -387,6 +412,7 @@ private:
     std::unique_ptr<Uint8Pass> uint8_pass;
     std::unique_ptr<VertexRepackPass> vertex_repack_pass;
     u32 vertex_repack_mask{};
+    u64 vertex_stride_serial{};
     bool static_vertex_repack{};
     QuadIndexedPass quad_index_pass;
 

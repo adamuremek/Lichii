@@ -28,6 +28,14 @@ template <typename ImageViews>
            (!image.aliased_images.empty() && image.newest_alias_tick > image.modification_tick);
 }
 
+[[nodiscard]] inline bool RenderTargetStillPrepared(const ImageBase& image, u64 frame) noexcept {
+    constexpr auto pending =
+        ImageFlagBits::CpuModified | ImageFlagBits::SparseTiles | ImageFlagBits::SparseLayers |
+        ImageFlagBits::UnwrittenSparse | ImageFlagBits::Remapped;
+    return image.last_use_frame == frame && True(image.flags & ImageFlagBits::GpuModified) &&
+           False(image.flags & pending) && image.aliased_images.empty();
+}
+
 /// Whether sampling any of the views now needs a resolve that prepares their images (fast draw
 /// delta draws keep the previous resolve's views and prepare none).
 template <typename Views, typename ImageViews, typename Images>

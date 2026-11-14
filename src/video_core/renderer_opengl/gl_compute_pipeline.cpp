@@ -91,7 +91,7 @@ void ComputePipeline::Configure() {
         buffer_cache.BindComputeStorageBuffer(ssbo_index, desc.cbuf_index, desc.cbuf_offset,
                                               desc.is_written, desc.indirect_offset,
 
-                                              desc.write_extent);
+                                              desc.access_extent);
         ++ssbo_index;
     }
     texture_cache.SynchronizeDescriptors(true);

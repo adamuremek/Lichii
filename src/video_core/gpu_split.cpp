@@ -143,6 +143,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     profile_publishes = Nx2Profile::Enabled();                      // TEST
     log_methods = std::getenv("EDEN_NX2_ACQUIRE_STATS") != nullptr; // TEST
+    const char* state_runs = std::getenv("EDEN_NX2_STATE_RUN");
+    batch_state_writes = state_runs != nullptr && state_runs[0] == '1' && !profile_publishes;
     ring = std::make_unique<u64[]>(RingWords);
     ++starts; // Before the back starts: it tags the entries of fenced writes with it (EntryTag)
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
@@ -616,7 +618,83 @@ void GpuSplit::DeferFunction(std::function<void()>&& func, Writes writes) {
         writes);
 }
 
-size_t GpuSplit::Execute(const u64* entry, size_t words) {
+bool GpuSplit::IsStateWrite(const Tegra::Engines::Maxwell3D& engine, u64 word) {
+    constexpr u64 mask = 0xf | HasSegment;
+    const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+    return (word & mask) == static_cast<u64>(Kind::Method) &&
+           method < Tegra::Engines::Maxwell3D::Regs::NUM_REGS &&
+           !engine.execution_mask[method];
+}
+
+size_t GpuSplit::ExecuteStateRun(Tegra::Engines::Maxwell3D& engine, const u64* entry, size_t words,
+                                 u64 publish_boundary) {
+    if (engine.perf_verify || engine.executing_macro != 0 || engine.draw_manager.HasDeferredDraw() ||
+        tick_requested.load(std::memory_order_relaxed) ||
+        hook_requested.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    const u64 target = (std::min)(wait_target.load(std::memory_order_relaxed), publish_boundary);
+    const size_t end = target > back_entry_start
+                           ? static_cast<size_t>((std::min)({u64{words}, u64{64},
+                                                            target - back_entry_start}))
+                           : 1;
+    if (end < 2) {
+        return 0;
+    }
+
+    // No entry here draws. One break suffices for the next draw to see changed state.
+    const bool fast_draw = Nx2FastDraw::Enabled();
+    const bool skip_same = engine.SkipSameValueWrites();
+    u32 break_method = ~0U;
+    const auto apply = [&](u64 word) {
+        const u32 method = static_cast<u32>((word >> 8) & 0xffff);
+        const u32 value = engine.ProcessShadowRam(method, static_cast<u32>(word >> 32));
+        u32& reg = engine.regs.reg_array[method];
+        const bool changed = reg != value;
+        if (!changed && skip_same) {
+            return;
+        }
+        if (fast_draw && break_method == ~0U && engine.pending_draw_register_break == 0 &&
+            changed && !engine.IsFastDrawParameter(method, reg, value)) {
+            if (engine.coalesce_draw_register_breaks) {
+                engine.pending_draw_register_break = method + 1;
+            } else {
+                break_method = method;
+            }
+        }
+        reg = value;
+        for (const auto& table : engine.dirty.tables) {
+            engine.dirty.flags[table[method]] = true;
+        }
+    };
+    size_t count = 0;
+    size_t pending = 0;
+    do {
+        if ((entry[count] & Direct) != 0) {
+            // The direct write consumes queued state in order. Entries in this run are still
+            // in the ring, so only the state that survives the run needs to enter the sink.
+            engine.ConsumeSink(*system);
+            for (; pending <= count; ++pending) {
+                apply(entry[pending]);
+            }
+        }
+        ++count;
+    } while (count < end && !tick_requested.load(std::memory_order_relaxed) &&
+             !hook_requested.load(std::memory_order_relaxed) &&
+             back_entry_start + count < wait_target.load(std::memory_order_relaxed) &&
+             IsStateWrite(engine, entry[count]));
+    for (; pending < count; ++pending) {
+        const u64 word = entry[pending];
+        engine.method_sink.emplace_back(static_cast<u32>((word >> 8) & 0xffff),
+                                        static_cast<u32>(word >> 32));
+    }
+    if (break_method != ~0U) {
+        Nx2FastDraw::Break(Nx2FastDraw::Reason::Register, break_method);
+    }
+    return count;
+}
+
+size_t GpuSplit::Execute(const u64* entry, size_t words, u64 publish_boundary) {
     const u64 head = entry[0];
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
@@ -661,6 +739,13 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                                                     count);
                 }
                 return count;
+            }
+            if (batch_state_writes && words > 1 && IsStateWrite(*maxwell3d, head) &&
+                IsStateWrite(*maxwell3d, entry[1])) {
+                if (const size_t count =
+                        ExecuteStateRun(*maxwell3d, entry, words, publish_boundary)) {
+                    return count;
+                }
             }
             if ((head & Direct) != 0) {
                 maxwell3d->ConsumeSink(*system);
@@ -794,7 +879,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             const size_t index = read_position & RingMask;
             back_entry_start = read_position;
             const size_t size =
-                Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index));
+                Execute(&ring[index], std::min<u64>(available - read_position, RingWords - index),
+                        last_store + 4096);
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {

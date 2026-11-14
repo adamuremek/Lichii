@@ -39,7 +39,7 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
 /// What a marker records: the precache file's size and last-write time, its entry count, the GPU
-/// driver version and device ID and the pipeline cache version.
+/// driver version and device ID, the pipeline cache version and the marker version.
 struct WarmStamp {
     u64 size{};
     s64 write_time{};
@@ -47,14 +47,21 @@ struct WarmStamp {
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u32 marker_version{};
 
-    /// True when `other` was written for the same file, driver, device and cache version (the
-    /// entry count is informative).
+    /// True when `other` was written for the same file, driver, device, cache version and marker
+    /// version (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
         return size == other.size && write_time == other.write_time && driver == other.driver &&
-               device_id == other.device_id && cache_version == other.cache_version;
+               device_id == other.device_id && cache_version == other.cache_version &&
+               marker_version == other.marker_version;
     }
 };
+
+/// Raised when the SPIR-V handed to the driver changes, so that the compute precache runs again.
+/// 4: shared shader functions are built as calls. Markers without this field no longer read.
+/// Test builds stored the calls mode (0 to 3) in this field, so versions start above that range.
+constexpr u32 WarmMarkerVersion = 4;
 
 /// The stamp of `warm_file` as it is now, empty when its size or time cannot be read.
 std::optional<WarmStamp> CurrentWarmStamp(const std::filesystem::path& warm_file, u64 entries,
@@ -103,7 +110,7 @@ struct DriverStamp {
 std::filesystem::path PrecachedPipelinesPath(u64 title_id);
 
 /// The pipeline key hashes in `file`, empty when there is none or it was written for another
-/// driver, device or cache version.
+/// driver, device or cache version, or before shared shader functions were built as calls.
 std::unordered_set<u64> ReadPrecachedPipelines(const std::filesystem::path& file,
                                                const DriverStamp& stamp);
 

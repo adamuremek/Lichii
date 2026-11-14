@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <random>
@@ -124,6 +127,10 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
         REQUIRE(memory.MaxContinuousRange(address, size) ==
                 memory.MaxContinuousRangeUncached(address, size));
         REQUIRE(memory.GetMemoryLayoutSize(address) == memory.GetMemoryLayoutSizeUncached(address));
+        const auto ranges = memory.GetBufferMappingSizes(address);
+        REQUIRE(ranges.layout == memory.GetMemoryLayoutSizeUncached(address));
+        const size_t remaining = address < address_space_end ? address_space_end - address : 0;
+        REQUIRE(ranges.continuous == memory.MaxContinuousRangeUncached(address, remaining));
     };
 
     // Known answers first, so the comparison isn't between two zeros.
@@ -256,4 +263,65 @@ TEST_CASE("Reads of GPU pages over unmapped device memory return zeros", "[memor
     std::ranges::fill(bytes, u8{0xcd});
     memory.ReadBlock(window, bytes.data(), size);
     REQUIRE(std::ranges::all_of(bytes, [](u8 value) { return value == 0; }));
+}
+
+TEST_CASE("GPU mapping lookup cost under steady draws and remaps", "[.mapping_query_benchmark]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    memory.BindRasterizer(&rasterizer);
+    constexpr GPUVAddr base = 0x4000'0000;
+    constexpr DAddr device_base = 0x1000'0000;
+    constexpr size_t stride = 0x8000;
+    constexpr size_t mapped = 0x4000;
+    constexpr size_t regions = 4096;
+    for (size_t i = 0; i < regions; ++i) {
+        memory.Map(base + i * stride, device_base + i * stride, mapped,
+                   Tegra::PTEKind::PITCH, false);
+    }
+    std::array<GPUVAddr, 4096> addresses{};
+    std::mt19937 rng{194974};
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        const size_t region = i % 8 == 0 ? rng() % regions : (i / 8) % 16;
+        addresses[i] = base + region * stride + (rng() % (mapped / 32)) * 32;
+    }
+
+    const auto measure = [&](size_t period, bool combined) {
+        constexpr size_t queries = 65'536;
+        u64 checksum = 0;
+        u64 expected = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < queries; ++i) {
+            if (period != 0 && i % period == 0) {
+                const size_t region = (i / period) % regions;
+                memory.Map(base + region * stride, device_base + region * stride, mapped,
+                           i % (period * 2) == 0 ? Tegra::PTEKind::PITCH
+                                                 : Tegra::PTEKind::GENERIC_16BX2,
+                           false);
+            }
+            const GPUVAddr address = addresses[i % addresses.size()];
+            if (combined) {
+                const auto ranges = memory.GetBufferMappingSizes(address);
+                checksum += ranges.layout + ranges.continuous;
+            } else {
+                checksum += memory.GetMemoryLayoutSize(address);
+                checksum += memory.MaxContinuousRange(address, mapped);
+            }
+        }
+        const std::chrono::duration<double, std::nano> elapsed =
+            std::chrono::steady_clock::now() - begin;
+        for (size_t i = 0; i < queries; ++i) {
+            expected += 2 * (mapped - addresses[i % addresses.size()] % stride);
+        }
+        CHECK(checksum == expected);
+        std::printf("remap period %zu %s: %.2f ns per GPU address\n", period,
+                    combined ? "combined" : "separate", elapsed.count() / queries);
+    };
+    for (const size_t period : {0, 256, 32}) {
+        measure(period, false);
+        measure(period, true);
+    }
 }

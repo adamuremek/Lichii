@@ -33,6 +33,8 @@ class MemoryTrackerBase {
     using Manager = WordManager<DeviceTracker, WORDS_STACK_NEEDED, HIGHER_PAGE_SIZE>;
 
 public:
+    static constexpr u32 NUM_SYNCHRONIZED_SLOTS = 64;
+
     MemoryTrackerBase(DeviceTracker& device_tracker_) : device_tracker{&device_tracker_} {}
     ~MemoryTrackerBase() = default;
 
@@ -147,6 +149,10 @@ public:
     /// mark or a cached-write flush sets CPU or Untracked bits again, so until one reaches its
     /// pages another scan would find and change nothing.
     void WatchSynchronized(u32 slot, VAddr cpu_addr, u64 size) noexcept {
+        if (IsRegionHot(cpu_addr, size)) {
+            synchronized_mask &= ~(u64{1} << slot);
+            return;
+        }
         synchronized_ranges[slot] = {Common::AlignDown(cpu_addr, BYTES_PER_PAGE),
                                      Common::AlignUp(cpu_addr + size, BYTES_PER_PAGE)};
         synchronized_mask |= u64{1} << slot;
@@ -154,6 +160,44 @@ public:
 
     [[nodiscard]] bool IsSynchronized(u32 slot) const noexcept {
         return ((synchronized_mask >> slot) & 1) != 0;
+    }
+
+    [[nodiscard]] bool IsRegionHot(VAddr cpu_addr, u64 size) noexcept {
+        return hot_pages != 0 &&
+               IteratePages<false>(cpu_addr, size, [](Manager* manager, u64 offset, size_t length) {
+                   return manager->IsRegionModified(Type::Hot, offset, length);
+               });
+    }
+
+    void SetHotPage(VAddr cpu_addr, bool hot) {
+        const VAddr page = Common::AlignDown(cpu_addr, BYTES_PER_PAGE);
+        if (IsRegionHot(page, BYTES_PER_PAGE) == hot) {
+            return;
+        }
+        if (hot) {
+            MarkRegionAsCpuModified(page, BYTES_PER_PAGE);
+            ++hot_pages;
+        } else {
+            ForgetSynchronized(page, BYTES_PER_PAGE);
+            --hot_pages;
+        }
+        IteratePages<false>(page, BYTES_PER_PAGE,
+                            [hot](Manager* manager, u64 offset, size_t length) {
+                                manager->ChangeRegionState(Type::Hot, hot,
+                                                           manager->cpu_addr + offset, length);
+                            });
+    }
+
+    template <typename Func>
+    void ForEachHotRange(VAddr cpu_addr, u64 size, Func&& func) {
+        if (hot_pages != 0) {
+            IteratePages<false>(cpu_addr, size,
+                                [&func](Manager* manager, u64 offset, size_t length) {
+                                    manager->ForEachModifiedRange(Type::Hot, false,
+                                                                  manager->cpu_addr + offset,
+                                                                  length, func);
+                                });
+        }
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
@@ -189,7 +233,7 @@ public:
 
     /// ForEachUploadRange without the clean words (word_manager.h) at either end of each manager's
     /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
-    template <typename Func>
+    template <bool KeepHot = false, typename Func>
     void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
         IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
             const u64 dirty =
@@ -200,8 +244,8 @@ public:
             const u64 begin = (std::max<u64>)(offset, std::countr_zero(dirty) * BYTES_PER_WORD);
             const u64 end =
                 (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
-            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
-                                          static_cast<s64>(end - begin), func);
+            manager->template ForEachModifiedRange<KeepHot>(
+                Type::CPU, true, manager->cpu_addr + begin, static_cast<s64>(end - begin), func);
         });
     }
     /// Verify mode: true when the clean words of the managers over a range match a recount.
@@ -328,8 +372,9 @@ private:
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
-    std::array<std::pair<VAddr, VAddr>, 64> synchronized_ranges{};
+    std::array<std::pair<VAddr, VAddr>, NUM_SYNCHRONIZED_SLOTS> synchronized_ranges{};
     u64 synchronized_mask{};
+    size_t hot_pages{};
     DeviceTracker* device_tracker = nullptr;
 };
 

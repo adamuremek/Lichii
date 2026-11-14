@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "common/assert.h"
+#include "common/gpu_benchmark_trial.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -151,9 +152,11 @@ struct ViewAnswer {
     };
     Kind kind;
     u64 position{};
+    bool shortened{};
 };
 
-ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, u64 device) {
+ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, u64 device,
+                   bool precise_wait = false) {
     using Kind = ViewAnswer::Kind;
     const auto& split = VideoCommon::GpuSplit::Get();
     const auto memory = [&] { return dma_pusher.memory_manager.Read<u32>(acquire.address); };
@@ -173,16 +176,27 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
     // (QueuedSemaphoreWriteAt), and copies, inline uploads and late-valued releases are placed.
     // At Ocarina of Time's water, ~540 equal acquires a second waited ~0.5 ms each for compute
     // work whose releases the front knew.
-    const auto unnoted_writes_ran = [&](u64 noted_position) {
+    const auto after_unnoted_writes = [&](u64 noted_position, Kind met) -> ViewAnswer {
         if (!VideoCommon::FrontQmdView::Get().Current() ||
-            !split.Ran(split.LastUnplacedWrite()) || !split.Ran(split.LastMappingChange())) {
-            return false;
+            !split.Ran(split.LastMappingChange())) {
+            return {Kind::Unknown, acquire.writers_before};
+        }
+        const u64 unplaced = split.LastUnplacedWrite();
+        if (!precise_wait && !split.Ran(unplaced)) {
+            return {Kind::Unknown, acquire.writers_before};
         }
         // A noted release is placed too (copy engine semaphores): at its own position it is the
         // write QueuedSemaphoreWriteAt reports.
         const u64 placed =
             split.PlacedWritesTarget(dma_pusher.memory_manager, acquire.address, sizeof(u32));
-        return placed <= noted_position || split.Ran(placed);
+        const u64 target = acquire.UnnotedWriterPosition(unplaced, placed, noted_position);
+        if (split.Ran(target)) {
+            return {met};
+        }
+        if (precise_wait && target < acquire.writers_before) {
+            return {Kind::Unknown, target, true};
+        }
+        return {Kind::Unknown, acquire.writers_before};
     };
     const bool settled = acquire.WaitsToReach() || split.Ran(acquire.writers_before);
     // The last release the front sent to the word decides while it may not be in memory.
@@ -209,18 +223,15 @@ ViewAnswer AskView(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
         if (!acquire.Matches(queued->payload)) {
             return {Kind::NotMet};
         }
-        if (settled || queued->position >= acquire.writers_before ||
-            unnoted_writes_ran(queued->position)) {
+        if (settled || queued->position >= acquire.writers_before) {
             return {Kind::MetByQueued};
         }
-        return {Kind::Unknown, acquire.writers_before};
+        return after_unnoted_writes(queued->position, Kind::MetByQueued);
     }
     if (!acquire.Matches(memory())) {
         return {Kind::NotMet};
     }
-    return settled || unnoted_writes_ran(0)
-               ? ViewAnswer{Kind::Met}
-               : ViewAnswer{Kind::Unknown, acquire.writers_before};
+    return settled ? ViewAnswer{Kind::Met} : after_unnoted_writes(0, Kind::Met);
 }
 
 // Has the back flush the word out of the buffer cache after the work sent before: memory holds
@@ -239,10 +250,10 @@ void RequestFlush(DmaPusher& dma_pusher, Puller::PendingAcquire& acquire, u64 de
 // EDEN_NX2_DRAIN_CHECK: what the drain path decides instead, to verify the view (a release the
 // back ran latches `waiter`, a suspended acquire's).
 bool MetAfterDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
-                   const void* waiter) {
+                   const Nx2SemaphoreWaiters::Latch* waiter) {
     DrainBack();
     return acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address)) ||
-           (waiter != nullptr && Nx2SemaphoreWaiters::Get().Latched(waiter));
+           (waiter && waiter->Latched());
 }
 
 // TEST (EDEN_NX2_DRAIN_CHECK): whether a fence-flagged release to the word at `device` may still
@@ -255,7 +266,8 @@ bool FencedWritePending(u64 device) {
 
 // TEST: checks a pass of the view against the drain path: whether the drained word meets it, and
 // whether a fenced release that landed during the drain changed it.
-bool PassStands(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire, const void* waiter,
+bool PassStands(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
+                const Nx2SemaphoreWaiters::Latch* waiter,
                 u64 device, bool poll, VideoCommon::Nx2DrainCheck::ViewPass how) {
     const bool fenced = FencedWritePending(device);
     const bool met = MetAfterDrain(dma_pusher, acquire, waiter);
@@ -302,21 +314,22 @@ ViewAnswer CheckAcquire(DmaPusher& dma_pusher, const Puller::PendingAcquire& acq
 
 // TEST: whether the view's resume of a poll stands (EDEN_NX2_DRAIN_CHECK).
 bool PollPassStands(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire,
-                    const void* waiter, u64 device, VideoCommon::Nx2DrainCheck::ViewPass how) {
+                    const Nx2SemaphoreWaiters::Latch& waiter, u64 device,
+                    VideoCommon::Nx2DrainCheck::ViewPass how) {
     if (!VideoCommon::Nx2DrainCheck::g_enabled) {
         return true;
     }
-    return PassStands(dma_pusher, acquire, waiter, device, true, how);
+    return PassStands(dma_pusher, acquire, &waiter, device, true, how);
 }
 
 // TEST: a suspended acquire resumes (EDEN_NX2_ACQUIRE_STATS).
-void NoteResumed(const void* waiter, const Puller::PendingAcquire& acquire,
+void NoteResumed(const Nx2SemaphoreWaiters::Latch& waiter, const Puller::PendingAcquire& acquire,
                  VideoCommon::Nx2AcquireStats::Resume how) {
     namespace Stats = VideoCommon::Nx2AcquireStats;
     if (!Stats::g_enabled) {
         return;
     }
-    const auto source = how == Stats::Resume::Latch ? Nx2SemaphoreWaiters::Get().LatchSource(waiter)
+    const auto source = how == Stats::Resume::Latch ? waiter.LatchSource()
                                                     : Stats::Source::Unknown;
     Stats::NoteResume(how, source, acquire.flushed,
                       std::chrono::steady_clock::now() - acquire.since);
@@ -396,7 +409,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         NoteAcquireCheck(dma_pusher, pending_acquire->address, true, met_before,
                          pending_acquire->Matches(current));
     }
-    if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+    if (semaphore_latch.Latched()) {
         if (static std::atomic<u32> rescued{};
             !pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
             LOG_INFO(HW_GPU, "Channel {} met semaphore {:#x} value {:#x} at its release (now {:#x})",
@@ -421,7 +434,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
         pending_acquire->last_fences = now;
         ReleaseFences(dma_pusher);
-        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+        if (semaphore_latch.Latched() ||
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
             return true;
         }
@@ -437,8 +450,8 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
     PendingAcquire& acquire = *pending_acquire;
     auto& split = VideoCommon::GpuSplit::Get();
     // A release the back ran latches the waiter, even if a later one changed the word again.
-    if (Nx2SemaphoreWaiters::Get().Latched(this)) {
-        NoteResumed(this, acquire, Resume::Latch);
+    if (semaphore_latch.Latched()) {
+        NoteResumed(semaphore_latch, acquire, Resume::Latch);
         return true;
     }
     if (acquire.flush_position && split.Ran(*acquire.flush_position)) {
@@ -450,20 +463,20 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
         const ViewAnswer answer = AskView(dma_pusher, acquire, device);
         switch (answer.kind) {
         case Kind::Met:
-            if (!PollPassStands(dma_pusher, acquire, this, device, ViewPass::Memory)) {
+            if (!PollPassStands(dma_pusher, acquire, semaphore_latch, device, ViewPass::Memory)) {
                 checked = true;
                 break;
             }
-            NoteResumed(this, acquire, Resume::Memory);
+            NoteResumed(semaphore_latch, acquire, Resume::Memory);
             return true;
         case Kind::MetByQueued:
-            if (!PollPassStands(dma_pusher, acquire, this, device, ViewPass::Queued)) {
+            if (!PollPassStands(dma_pusher, acquire, semaphore_latch, device, ViewPass::Queued)) {
                 checked = true;
                 break;
             }
             // What the front reads after the acquire waits for the work sent before the release.
             split.NoteSync();
-            NoteResumed(this, acquire, Resume::Queued);
+            NoteResumed(semaphore_latch, acquire, Resume::Queued);
             return true;
         case Kind::Flush:
             RequestFlush(dma_pusher, acquire, device);
@@ -477,10 +490,10 @@ bool Puller::PollWithoutDrain(DmaPusher& dma_pusher, u64 device) {
         }
     }
     if (VideoCommon::Nx2DrainCheck::g_enabled && !checked) [[unlikely]] {
-        const bool met = MetAfterDrain(dma_pusher, acquire, this);
+        const bool met = MetAfterDrain(dma_pusher, acquire, &semaphore_latch);
         VideoCommon::Nx2DrainCheck::NoteViewWait(true, met);
         if (met) {
-            NoteResumed(this, acquire, Resume::Drain);
+            NoteResumed(semaphore_latch, acquire, Resume::Drain);
             return true;
         }
     }
@@ -499,7 +512,7 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire) {
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
-        Nx2SemaphoreWaiters::Get().Remove(this);
+        Nx2SemaphoreWaiters::Get().Remove(semaphore_latch);
     }
     return true;
 }
@@ -663,15 +676,16 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // even if a later one overwrites it.
         auto& waiters = Nx2SemaphoreWaiters::Get();
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
-            waiters.Add(this, *device, acquire.value, acquire.operation);
+            waiters.Add(semaphore_latch, *device, acquire.value, acquire.operation);
         }
         ReleaseFences(dma_pusher);
-        if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        if (!semaphore_latch.Latched() &&
+            !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
         } else {
-            waiters.Remove(this);
+            waiters.Remove(semaphore_latch);
         }
     } else {
         DrainBack();
@@ -706,6 +720,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 }
 
 bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire) {
+    namespace Trial = Common::GpuBenchmarkTrial;
     using Kind = ViewAnswer::Kind;
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
     if (!device || !ViewApplies()) {
@@ -714,13 +729,26 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire)
     auto& split = VideoCommon::GpuSplit::Get();
     acquire.writers_before = split.LastWriterPosition();
     acquire.sent_at = split.Position();
-    ViewAnswer answer = AskView(dma_pusher, acquire, *device);
+    static const bool benchmark = Trial::ConfiguredExperiment() == Trial::Experiment::AcquireWaits;
+    static const bool configured = [] {
+        const char* value = std::getenv("EDEN_NX2_PRECISE_ACQUIRE_WAIT");
+        return value && value[0] == '1';
+    }();
+    const bool precise_wait =
+        benchmark ? Trial::ResolveToggle(
+                        Trial::GetMode(Trial::applied.load(std::memory_order_acquire)),
+                        Trial::Mode::PreciseAcquireWait, configured)
+                  : configured;
+    ViewAnswer answer = AskView(dma_pusher, acquire, *device, precise_wait);
     // The value is in memory once the back ran that work, before what was sent after it. A
     // release the front can't value, then the writers before the acquire: two waits at most.
     u32 waits = 0;
     for (; answer.kind == Kind::Unknown && waits < 2; ++waits) {
+        if (answer.shortened && benchmark) {
+            Trial::acquire_waits_shortened.fetch_add(1, std::memory_order_relaxed);
+        }
         split.WaitForPosition(answer.position, VideoCommon::DrainSite::Acquire);
-        answer = AskView(dma_pusher, acquire, *device);
+        answer = AskView(dma_pusher, acquire, *device, precise_wait);
     }
     if (VideoCommon::Nx2DrainCheck::g_enabled || VideoCommon::Nx2AcquireStats::g_enabled)
         [[unlikely]] {
@@ -743,7 +771,7 @@ bool Puller::AcquireWithoutDrain(DmaPusher& dma_pusher, PendingAcquire& acquire)
     }
     // Suspended: a release the back runs latches the waiter, registered before any fence work,
     // and the polls see the others in memory or in the view (PollWithoutDrain).
-    Nx2SemaphoreWaiters::Get().Add(this, *device, acquire.value, acquire.operation);
+    Nx2SemaphoreWaiters::Get().Add(semaphore_latch, *device, acquire.value, acquire.operation);
     MaybeReleaseFences(dma_pusher, acquire);
     pending_acquire = acquire;
     dma_pusher.suspensions.fetch_add(1, std::memory_order_release);

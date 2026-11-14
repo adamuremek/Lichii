@@ -144,3 +144,37 @@ TEST_CASE("Changing the active native policy preserves recorded work",
     REQUIRE(Advance(counter, true, false) == Action::Dispatch);
     REQUIRE(counter == 32);
 }
+
+TEST_CASE("Adaptive submission checks respect the native budget and cadence",
+          "[video_core][submission_policy]") {
+    using namespace Vulkan::SubmissionPolicy;
+    CHECK_FALSE(CheckFrontWait(96, AmdNativeBudget));
+    CHECK(CheckFrontWait(128, AmdNativeBudget));
+    CHECK_FALSE(CheckFrontWait(129, AmdNativeBudget));
+    CHECK(CheckFrontWait(160, AmdNativeBudget));
+    CHECK_FALSE(CheckGpuIdle(192, AmdNativeBudget));
+    CHECK(CheckGpuIdle(256, AmdNativeBudget));
+    CHECK_FALSE(CheckGpuIdle(288, AmdNativeBudget));
+    CHECK(CheckGpuIdle(320, AmdNativeBudget));
+    CHECK_FALSE(CheckGpuIdle(512, AmdNativeBudget));
+    CHECK_FALSE(CheckFrontWait(128, 129));
+    CHECK_FALSE(CheckFrontWait(64, 0));
+    CHECK_FALSE(CheckGpuIdle(128, 1));
+    CHECK(CheckFrontWait(64, DefaultNativeBudget));
+    CHECK_FALSE(CheckGpuIdle(128, DefaultNativeBudget));
+}
+
+TEST_CASE("Adaptive submission forgets work already submitted by a different path",
+          "[video_core][submission_policy]") {
+    Vulkan::SubmissionPolicy::WorkSinceSubmit window;
+    for (u32 draw = 0; draw < 128; ++draw) {
+        REQUIRE(window.BeforeWork(1) == draw);
+    }
+    CHECK(window.BeforeWork(1) == 128);
+    // The draw that triggered the early submit will be recorded on the next tick.
+    CHECK(window.BeforeWork(2) == 0);
+    CHECK(window.BeforeWork(2) == 1);
+    // A fence and a download submitted before the next draw.
+    CHECK(window.BeforeWork(4) == 0);
+    CHECK(window.BeforeWork(4) == 1);
+}

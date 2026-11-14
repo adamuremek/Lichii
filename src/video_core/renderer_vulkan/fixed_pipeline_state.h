@@ -16,6 +16,10 @@
 #include "video_core/surface.h"
 #include "video_core/transform_feedback.h"
 
+namespace Shader {
+struct Info;
+}
+
 namespace Vulkan {
 
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
@@ -266,6 +270,12 @@ struct FixedPipelineState {
     /// attribute_types as the registers give it: with VK_EXT_vertex_input_dynamic_state, all that
     /// the vertex attribute formats put in the key.
     [[nodiscard]] static u64 DynamicAttributeTypes(const Maxwell& regs) noexcept;
+    [[nodiscard]] static u64 UsedAttributeTypeMask(const Shader::Info& vertex) noexcept;
+
+    [[nodiscard]] bool MatchesWithAttributeTypeMask(const FixedPipelineState& rhs,
+                                                    u64 mask) const noexcept;
+    [[nodiscard]] size_t ColorAttachmentCount() const noexcept;
+    [[nodiscard]] bool MatchesWithoutTrailingBlend(const FixedPipelineState& rhs) const noexcept;
 
     size_t Hash() const noexcept;
 

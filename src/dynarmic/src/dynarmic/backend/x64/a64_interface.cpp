@@ -63,7 +63,7 @@ public:
     Impl(Jit* jit, UserConfig conf)
         : conf(conf)
         , block_of_code(GenRunCodeCallbacks(conf.callbacks, &GetCurrentBlockThunk, this, conf), JitStateInfo{jit_state}, conf.code_cache_size, GenRCP(conf))
-        , emitter(block_of_code, conf, jit)
+        , emitter(block_of_code, conf, jit, jit_state)
         , polyfill_options(GenPolyfillOptions(block_of_code))
     {
         ASSERT(conf.page_table_address_space_bits >= 12 && conf.page_table_address_space_bits <= 64);
@@ -258,7 +258,12 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        A64::Translate(ir_block, arch_descriptor, get_code,
+                       {.define_unpredictable_behaviour = conf.define_unpredictable_behaviour,
+                        .wall_clock_cntpct = conf.wall_clock_cntpct,
+                        .native_lse_atomics = conf.native_lse_atomics && conf.fastmem_pointer &&
+                                              conf.fastmem_exclusive_access &&
+                                              conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)});
         Optimization::Optimize(ir_block, conf, polyfill_options);
         return emitter.Emit(ir_block).entrypoint;
     }

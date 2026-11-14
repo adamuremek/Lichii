@@ -305,6 +305,7 @@ public:
         s32 src_y0;
         s32 src_x1;
         s32 src_y1;
+        bool prefer_transfer_copy = false;
     };
 
 private:

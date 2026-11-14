@@ -91,6 +91,46 @@ TEST_CASE("Core pinning: 8 cores, 16 threads", "[common][core_pinning]") {
     CheckCoresAreDedicated(processors, plan);
 }
 
+TEST_CASE("Cache-local pinning keeps the renderer and six guest cores on separate caches",
+          "[common][core_pinning]") {
+    auto processors = Uniform(12, 2);
+    for (size_t index = 0; index < processors.size(); ++index) {
+        processors[index].last_level_cache = index < 12 ? 0 : 12;
+    }
+    const auto plan = Common::PlanGpuThreadPinning(processors, 6);
+    CHECK(plan.front == Ids(2, 2));
+    CHECK(plan.back == Ids(4, 2));
+    CHECK(plan.vulkan_worker == Ids(6, 2));
+    CHECK(plan.guest == Ids(12, 12));
+    REQUIRE(plan.guest_by_core.size() == 6);
+    for (u32 core = 0; core < 6; ++core) {
+        CHECK(plan.guest_by_core[core] == Ids(12 + 2 * core, 2));
+    }
+    CheckCoresAreDedicated(processors, plan);
+}
+
+TEST_CASE("Cache-local pinning keeps the default plan when there are too few dedicated cores",
+          "[common][core_pinning]") {
+    auto processors = Uniform(11, 2);
+    for (size_t index = 0; index < processors.size(); ++index) {
+        processors[index].last_level_cache = index < 12 ? 0 : 12;
+    }
+    const auto original = Common::PlanGpuThreadPinning(processors);
+    const auto check_fallback = [&] {
+        const auto plan = Common::PlanGpuThreadPinning(processors, 6);
+        CHECK(plan.front == original.front);
+        CHECK(plan.back == original.back);
+        CHECK(plan.guest == original.guest);
+        CHECK(plan.guest_by_core.empty());
+        CHECK(plan.vulkan_worker.empty());
+    };
+    check_fallback();
+    for (auto& processor : processors) {
+        processor.last_level_cache.reset();
+    }
+    check_fallback();
+}
+
 TEST_CASE("Core pinning: 6 cores, 12 threads", "[common][core_pinning]") {
     const auto processors = Uniform(6, 2);
     const auto plan = Common::PlanGpuThreadPinning(processors);

@@ -16,6 +16,8 @@
 
 #include <fmt/format.h>
 
+#include "common/literals.h"
+#include "common/memory_detect.h"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -23,6 +25,7 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_gpu_cost.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -423,6 +426,10 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
                                        DescriptorPool& descriptor_pool)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       staging_pool{staging_pool_}, guest_descriptor_queue{guest_descriptor_queue_},
+      batch_readback_copies{[] {
+          const char* value = std::getenv("EDEN_NX2_BATCH_READBACK_COPIES");
+          return value && value[0] == '1';
+      }()},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_), reorder_check{UploadReorderCheck::Create(scheduler_)} {
@@ -470,6 +477,10 @@ StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
     return staging_pool.Request(size, MemoryUsage::Upload);
 }
 
+LargeUploadStaging BufferCacheRuntime::TryLargeUploadStaging(size_t size) {
+    return staging_pool.TryLargeUpload(size);
+}
+
 StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
     return staging_pool.Request(size, MemoryUsage::Download, deferred);
 }
@@ -492,6 +503,25 @@ u64 BufferCacheRuntime::GetDeviceMemoryUsage() const {
 
 bool BufferCacheRuntime::CanReportMemoryUsage() const {
     return device.CanReportMemoryUsage();
+}
+
+bool BufferCacheRuntime::RetainsLargeBuffers() const {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_RETAIN_LARGE_BUFFERS");
+        return value && value[0] == '1';
+    }();
+    return enabled && !device.IsIntegrated() && CanReportMemoryUsage();
+}
+
+u64 BufferCacheRuntime::LargeBufferRetentionLimit() const {
+    using namespace Common::Literals;
+
+    const u64 budget = device.GetDeviceMemoryBudget();
+    if (budget < 12_GiB) {
+        return 0;
+    }
+    const auto commit_room = Common::GetSystemCommitRoom();
+    return commit_room && *commit_room < 2_GiB ? 0 : budget - 2_GiB;
 }
 
 u32 BufferCacheRuntime::GetUniformBufferAlignment() const {
@@ -759,6 +789,32 @@ void BufferCacheRuntime::CopyBuffer(VkBuffer dst_buffer, VkBuffer src_buffer,
         location);
 }
 
+void BufferCacheRuntime::CopyReadbackBatch(VkBuffer staging, std::span<const ReadbackCopy> copies,
+                                            std::source_location location) {
+    if (!staging || copies.empty()) {
+        return;
+    }
+    UploadBatch batch;
+    batch.copies.reserve(copies.size());
+    for (const auto& [source, copy] : copies) {
+        const VkBuffer src = source->Handle();
+        if (!src) {
+            continue;
+        }
+        NoteCheckUse(src, copy.src_offset, copy.size, UploadReorderCheck::Source::CopyRead);
+        NoteCheckUse(staging, copy.dst_offset, copy.size, UploadReorderCheck::Source::CopyWrite);
+        const VkBufferCopy region = MakeBufferCopy(copy);
+        batch.Add(src, staging, std::span{&region, 1});
+    }
+    if (batch.Empty()) {
+        return;
+    }
+    scheduler.RequestOutsideRenderPassOperationContext(location);
+    scheduler.Record([batch = std::move(batch)](vk::CommandBuffer cmdbuf) {
+        UploadBatch::Record(cmdbuf, batch.copies, batch.groups);
+    }, location);
+}
+
 void BufferCacheRuntime::PreCopyBarrier() {
     static constexpr VkMemoryBarrier READ_BARRIER{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -938,6 +994,7 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset
         stride = 72;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
+        ++vertex_stride_serial;
         scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
             const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
             const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
@@ -999,6 +1056,7 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
         return;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
+        ++vertex_stride_serial;
         scheduler.Record([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindVertexBuffers2EXT(bindings_.min_index, binding_count, buffer_handles_.data(), bindings_.offsets.data(), bindings_.sizes.data(), bindings_.strides.data());
         });

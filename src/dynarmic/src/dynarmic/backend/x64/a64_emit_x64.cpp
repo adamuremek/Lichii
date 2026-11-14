@@ -57,8 +57,9 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
     return fpcr_controlled ? Location().FPCR() : Location().FPCR().ASIMDStandardValue();
 }
 
-A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
-        : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface,
+                       A64JitState& jit_state)
+        : EmitX64(code), conf(conf), jit_state(jit_state), jit_interface{jit_interface} {
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();

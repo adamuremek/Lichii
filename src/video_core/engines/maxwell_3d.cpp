@@ -15,6 +15,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/bit_util.h"
@@ -70,6 +71,20 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
 }
 
 Maxwell3D::~Maxwell3D() = default;
+
+void Maxwell3D::SetDrawRegisterCoalescing(bool enabled) {
+    if (!enabled) {
+        static_cast<void>(ObserveFastDrawSerial());
+    }
+    coalesce_draw_register_breaks = enabled;
+}
+
+u64 Maxwell3D::ObserveFastDrawSerial() {
+    if (const u32 method = std::exchange(pending_draw_register_break, 0)) {
+        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method - 1);
+    }
+    return VideoCommon::Nx2FastDraw::Serial();
+}
 
 void Maxwell3D::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -350,7 +365,61 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
-bool Maxwell3D::IsFastDrawParameter(u32 method) {
+bool Maxwell3D::IsFastDrawParameter(u32 method, u32 previous, u32 next) const {
+    const auto& raster_state = VideoCommon::Nx2FastDraw::g_raster_state_reuse;
+    if (raster_state.enabled) {
+        switch (method) {
+        case MAXWELL3D_REG_INDEX(gl_cull_face):
+        case MAXWELL3D_REG_INDEX(gl_cull_test_enabled):
+            return raster_state.cull_dynamic;
+        case MAXWELL3D_REG_INDEX(viewport_clip_control):
+            return raster_state.depth_clamp_dynamic ||
+                   Regs::ViewportClipControl::DepthClampDisabled(previous) ==
+                       Regs::ViewportClipControl::DepthClampDisabled(next);
+        default:
+            break;
+        }
+        constexpr u32 viewports = MAXWELL3D_REG_INDEX(viewports);
+        constexpr u32 viewports_end = viewports + sizeof(Regs::viewports) / sizeof(u32);
+        if (method >= viewports && method < viewports_end) {
+            return true;
+        }
+        constexpr u32 transforms = MAXWELL3D_REG_INDEX(viewport_transform);
+        constexpr u32 transform_words = sizeof(Regs::ViewportTransform) / sizeof(u32);
+        constexpr u32 transforms_end = transforms + Regs::NumViewports * transform_words;
+        constexpr u32 swizzle = offsetof(Regs::ViewportTransform, swizzle) / sizeof(u32);
+        if (method >= transforms && method < transforms_end) {
+            return (method - transforms) % transform_words < swizzle;
+        }
+        constexpr u32 constant_color = MAXWELL3D_REG_INDEX(const_color_rendering);
+        // No renderer consumes the constant color rendering registers.
+        if (method - constant_color < sizeof(Regs::ConstantColorRendering) / sizeof(u32)) {
+            return true;
+        }
+        const auto is_trailing_attachment = [&](u32 attachment) {
+            return attachment > 0 && std::ranges::none_of(
+                       std::span{regs.rt}.subspan(attachment), [](const auto& rt) {
+                           return rt.format != Tegra::RenderTargetFormat::NONE;
+                       });
+        };
+        constexpr u32 blend_enables = MAXWELL3D_REG_INDEX(blend.enable);
+        // Attachment zero also selects the fragment shader's dual-source output mode.
+        if (const u32 attachment = method - blend_enables; attachment < Regs::NumRenderTargets) {
+            return is_trailing_attachment(attachment);
+        }
+        constexpr u32 color_masks = MAXWELL3D_REG_INDEX(color_mask);
+        static_assert(sizeof(Regs::ColorMask) == sizeof(u32));
+        if (const u32 attachment = method - color_masks; attachment < Regs::NumRenderTargets) {
+            return attachment > 0 && (regs.color_mask_common || is_trailing_attachment(attachment));
+        }
+        constexpr u32 blend_targets = MAXWELL3D_REG_INDEX(blend_per_target);
+        constexpr u32 words_per_target = sizeof(Regs::BlendPerTarget) / sizeof(u32);
+        if (const u32 attachment = (method - blend_targets) / words_per_target;
+            attachment < Regs::NumRenderTargets) {
+            return !regs.blend_per_target_enabled || !regs.blend.enable[attachment] ||
+                   is_trailing_attachment(attachment);
+        }
+    }
     switch (method) {
     case MAXWELL3D_REG_INDEX(const_buffer.size):
     case MAXWELL3D_REG_INDEX(const_buffer.address_high):
@@ -382,6 +451,16 @@ bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
 }
 
 bool Maxwell3D::IsFastDrawNeutralMethod(u32 method) {
+    // Shader register counts are guest scheduling metadata. Shader lookup uses the program
+    // address and enable bits, which still invalidate reuse when they change.
+    constexpr u32 count_word = MAXWELL3D_REG_INDEX(pipelines) +
+                               offsetof(Regs::Pipeline, register_count) / sizeof(u32);
+    constexpr u32 pipeline_words = sizeof(Regs::Pipeline) / sizeof(u32);
+    const u32 from_first_count = method - count_word;
+    if (from_first_count < Regs::MaxShaderProgram * pipeline_words &&
+        from_first_count % pipeline_words == 0) {
+        return true;
+    }
     switch (method) {
     // A counter reset only touches the query cache. The render enable condition decides whether
     // the next draws run (ShouldExecute, or host conditional rendering), not what they bind; a
@@ -1231,6 +1310,7 @@ struct Maxwell3D::FrontState {
     bool sink_pending{};
     u32 split_start{}; ///< GpuSplit::Starts() when this copy was made
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    bool batch_macro_writes{};
     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
     bool instance_loop{};
 
@@ -1670,6 +1750,11 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->control = shadow_state.shadow_ram_control;
         front->bindings = state;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+#ifdef ARCHITECTURE_x86_64
+        if (const char* value = std::getenv("EDEN_NX2_BATCH_MACRO_WRITES")) {
+            front->batch_macro_writes = std::string_view{value} == "1";
+        }
+#endif
         front->split_start = split.Starts();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
@@ -2003,7 +2088,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         if (!engine.native_jit) {
             engine.native_jit = std::make_shared<TuringMacroJit>();
         }
-        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+        engine.native_jit->Prepare(engine.native_code, engine.native_code_generation,
+                                   fs.batch_macro_writes);
         const auto result = engine.native_jit->Execute(
             start, fs.parameters, std::span<u32>{native_data_ram}, read, emit);
 #else

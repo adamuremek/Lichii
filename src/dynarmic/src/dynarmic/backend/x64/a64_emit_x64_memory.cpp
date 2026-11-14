@@ -22,6 +22,7 @@
 #include "dynarmic/backend/x64/emit_x64_memory.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/perf_map.h"
+#include "dynarmic/common/atomic.h"
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 
@@ -407,6 +408,122 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory128(A64EmitContext& ctx, IR::Inst* i
     } else {
         EmitExclusiveWriteMemory<128, &A64::UserCallbacks::MemoryWriteExclusive128>(ctx, inst);
     }
+}
+
+namespace {
+
+template<typename T, bool cas>
+u64 AtomicMemoryFallback(A64EmitX64& emitter, u64 address, u64 operand, u64 desired) {
+    auto& callbacks = *emitter.conf.callbacks;
+    for (;;) {
+        const T old = static_cast<T>(callbacks.MemoryRead(address, sizeof(T)));
+        if (Atomic::Load(&emitter.jit_state.halt_reason) & static_cast<u32>(HaltReason::MemoryAbort)) {
+            return old;
+        }
+        const T value = cas ? (old == static_cast<T>(operand) ? static_cast<T>(desired) : old)
+                            : static_cast<T>(old + static_cast<T>(operand));
+        const bool stored = sizeof(T) == 8 ? callbacks.MemoryWriteExclusive64(address, value, old)
+                                           : callbacks.MemoryWriteExclusive32(address, value, old);
+        if (stored ||
+            (Atomic::Load(&emitter.jit_state.halt_reason) & static_cast<u32>(HaltReason::MemoryAbort))) {
+            return old;
+        }
+    }
+}
+
+}  // namespace
+
+template<typename T, bool cas>
+void A64EmitX64::EmitAtomicMemory(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    const auto fallback = &AtomicMemoryFallback<T, cas>;
+    const auto fastmem = ShouldFastmem(ctx, inst);
+    if (!fastmem) {
+        if constexpr (cas) {
+            ctx.reg_alloc.HostCall(code, inst, {}, args[1], args[2], args[3]);
+        } else {
+            ctx.reg_alloc.HostCall(code, inst, {}, args[1], args[2]);
+        }
+        code.mov(code.ABI_PARAM1, std::bit_cast<u64>(this));
+        code.CallFunction(fallback);
+        EmitCheckMemoryAbort(ctx, inst);
+        return;
+    }
+
+    if constexpr (cas) {
+        ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+    }
+    const Xbyak::Reg64 address = ctx.reg_alloc.UseGpr(code, args[1]);
+    const Xbyak::Reg64 result = cas ? rax : ctx.reg_alloc.UseScratchGpr(code, args[2]);
+    const Xbyak::Reg64 operand = cas ? ctx.reg_alloc.UseGpr(code, args[2]) : result;
+    const Xbyak::Reg64 desired = cas ? ctx.reg_alloc.UseGpr(code, args[3]) : result;
+
+    const SharedLabel abort = ctx.GenSharedLabel(), end = ctx.GenSharedLabel();
+    bool require_abort = false;
+    const auto pointer = EmitFastmemVAddr(code, ctx, *abort, address, require_abort);
+    const auto memory = sizeof(T) == 8 ? qword[pointer] : dword[pointer];
+    const Xbyak::Reg source = sizeof(T) == 8 ? Xbyak::Reg(desired) : Xbyak::Reg(desired.cvt32());
+    if constexpr (cas) {
+        if constexpr (sizeof(T) == 8) {
+            code.mov(result, operand);
+        } else {
+            code.mov(result.cvt32(), operand.cvt32());
+        }
+    }
+
+    const auto location = code.getCurr();
+    code.lock();
+    if constexpr (cas) {
+        code.cmpxchg(memory, source);
+    } else {
+        code.xadd(memory, source);
+    }
+    const auto resume = code.getCurr();
+    code.L(*end);
+    ctx.deferred_emits.emplace_back([=, this] {
+        const auto stub = code.getCurr<void (*)()>();
+        const auto except = HostLocRegIdx(result.getIdx());
+        ABI_PushCallerSaveRegistersAndAdjustStackExcept(code, except);
+        code.push(address);
+        code.push(operand);
+        if constexpr (cas) {
+            code.mov(code.ABI_PARAM4, desired);
+        }
+        code.pop(code.ABI_PARAM3);
+        code.pop(code.ABI_PARAM2);
+        code.mov(code.ABI_PARAM1, std::bit_cast<u64>(this));
+        code.CallFunction(fallback);
+        if (result.getIdx() != code.ABI_RETURN.getIdx()) {
+            code.mov(result, code.ABI_RETURN);
+        }
+        ABI_PopCallerSaveRegistersAndAdjustStackExcept(code, except);
+        code.ret();
+
+        AddFastmemPatch(location, resume, stub, *fastmem, conf.recompile_on_exclusive_fastmem_failure);
+        if (require_abort) {
+            code.L(*abort);
+            code.call(stub);
+            code.jmp(*end, code.T_NEAR);
+        }
+    });
+    ctx.reg_alloc.DefineValue(code, inst, result);
+    EmitCheckMemoryAbort(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicAddMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicMemory<u32, false>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicAddMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicMemory<u64, false>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicCasMemory32(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicMemory<u32, true>(ctx, inst);
+}
+
+void A64EmitX64::EmitA64AtomicCasMemory64(A64EmitContext& ctx, IR::Inst* inst) {
+    EmitAtomicMemory<u64, true>(ctx, inst);
 }
 
 void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::Label* end) {

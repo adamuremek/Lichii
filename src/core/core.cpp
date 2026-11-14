@@ -767,9 +767,9 @@ std::span<GPUDirtyMemoryManager> System::GetGPUDirtyMemoryManager() {
     return impl->gpu_dirty_memory_managers;
 }
 
-void System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback) {
+void System::GatherGPUDirtyMemory(std::function<void(PAddr, size_t)>& callback, bool skip_empty) {
     for (auto& manager : impl->gpu_dirty_memory_managers) {
-        manager.Gather(callback);
+        manager.Gather(callback, skip_empty);
     }
 }
 
